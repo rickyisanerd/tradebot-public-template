@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TradeBot Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #0b1020; color: #edf1f7; margin: 0; }
+    .wrap { max-width: 1240px; margin: 0 auto; padding: 24px; }
+    .row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
+    .card { background: #151d36; border-radius: 16px; padding: 18px; box-shadow: 0 12px 30px rgba(0,0,0,.25); }
+    h1, h2 { margin-top: 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid rgba(255,255,255,.08); vertical-align: top; }
+    .grid-2 { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; margin-bottom: 20px; }
+    .muted { color: #9fb0cf; }
+    .buy { color: #7ef29a; font-weight: bold; }
+    .watch { color: #ffd166; font-weight: bold; }
+    .pill { display: inline-block; padding: 4px 9px; border-radius: 999px; background: #273556; margin-right: 6px; margin-bottom: 6px; }
+    .warn { color: #ffb86b; font-weight: bold; }
+    .ok { color: #7ef29a; }
+    form { display: inline-block; margin-right: 10px; }
+    button { background: #5b8cff; color: white; border: 0; border-radius: 10px; padding: 10px 14px; cursor: pointer; font-weight: bold; }
+    button:hover { opacity: 0.92; }
+    .section { margin-bottom: 20px; }
+    @media (max-width: 980px) {
+      .row, .grid-2 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>TradeBot Dashboard</h1>
+  <p class="muted">Mode: {{ mode }} | Provider: {{ provider }} | Auto trade: {% if auto_trade_enabled %}on every {{ auto_trade_interval_minutes }} minute(s){% else %}off{% endif %}.</p>
+  {% if degraded_mode %}
+  <p class="warn">Decision support is in degraded mode because one or more external signal sources are stale or failing. Trading still uses cached signals.</p>
+  {% endif %}
+  {% if safety_status.pause_new_buys %}
+  <p class="warn">New buys are paused: {{ safety_status.reasons|join('; ') }}</p>
+  {% endif %}
+
+  <div class="section">
+    <form method="post" action="/scan"><button>Run Scan</button></form>
+    <form method="post" action="/trade-once"><button>Trade Once</button></form>
+    <form method="post" action="/refresh-signals"><button>Refresh Signals</button></form>
+    <form method="post" action="/refresh-congress"><button>Refresh Congress</button></form>
+  </div>
+
+  <div class="row">
+    <div class="card"><div class="muted">Cash</div><h2>${{ '%.2f'|format(account.cash) }}</h2></div>
+    <div class="card"><div class="muted">Equity</div><h2>${{ '%.2f'|format(account.equity) }}</h2></div>
+    <div class="card"><div class="muted">Buying Power</div><h2>${{ '%.2f'|format(account.buying_power) }}</h2></div>
+    <div class="card"><div class="muted">Open Positions</div><h2>{{ positions|length }}</h2></div>
+  </div>
+
+  <div class="row">
+    <div class="card"><div class="muted">Realized P&L</div><h2>${{ '%.2f'|format(performance.realized_pnl) }}</h2></div>
+    <div class="card"><div class="muted">Unrealized P&L</div><h2>${{ '%.2f'|format(performance.unrealized_pnl) }}</h2></div>
+    <div class="card"><div class="muted">Tracked P&L</div><h2>${{ '%.2f'|format(performance.total_pnl) }}</h2></div>
+    <div class="card"><div class="muted">Return vs Baseline</div><h2>{{ '%.2f'|format(performance.total_return_pct) }}%</h2></div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>Performance summary</h2>
+      <table>
+        <tbody>
+          <tr><th>Baseline equity</th><td>${{ '%.2f'|format(performance.baseline_equity) }}</td></tr>
+          <tr><th>High-water mark</th><td>${{ '%.2f'|format(performance.peak_equity) }}</td></tr>
+          <tr><th>Open cost basis</th><td>${{ '%.2f'|format(performance.open_cost_basis) }}</td></tr>
+          <tr><th>Open market value</th><td>${{ '%.2f'|format(performance.open_market_value) }}</td></tr>
+          <tr><th>Closed winners / losers</th><td>{{ performance.closed_winners }} / {{ performance.closed_losers }}</td></tr>
+          <tr><th>Open winners / losers</th><td>{{ performance.open_winners }} / {{ performance.open_losers }}</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Best and worst open names</h2>
+      <table>
+        <thead><tr><th>Symbol</th><th>P&L</th><th>P&L %</th></tr></thead>
+        <tbody>
+          {% for item in performance.top_winners %}
+          <tr>
+            <td>{{ item.symbol }}</td>
+            <td>${{ '%.2f'|format(item.pnl_amount) }}</td>
+            <td>{{ '%.2f'|format(item.pnl_pct) }}%</td>
+          </tr>
+          {% endfor %}
+          {% if not performance.top_winners %}
+          <tr><td colspan="3" class="muted">No open winners yet.</td></tr>
+          {% endif %}
+          {% for item in performance.top_losers %}
+          <tr>
+            <td>{{ item.symbol }}</td>
+            <td>${{ '%.2f'|format(item.pnl_amount) }}</td>
+            <td>{{ '%.2f'|format(item.pnl_pct) }}%</td>
+          </tr>
+          {% endfor %}
+          {% if not performance.top_losers %}
+          <tr><td colspan="3" class="muted">No open losers yet.</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>Dynamic controls</h2>
+      <table>
+        <tbody>
+          <tr><th>Growth ratio</th><td>{{ '%.3f'|format(dynamic_controls.growth_ratio) }}</td></tr>
+          <tr><th>Drawdown</th><td>{{ '%.2f'|format(dynamic_controls.drawdown_pct) }}% ({{ dynamic_controls.drawdown_state }})</td></tr>
+          <tr><th>Max total capital</th><td>${{ '%.2f'|format(dynamic_controls.max_total_capital) }}</td></tr>
+          <tr><th>Max open positions</th><td>{{ dynamic_controls.max_open_positions }}</td></tr>
+          <tr><th>Max new positions/run</th><td>{{ dynamic_controls.max_new_positions_per_run }}</td></tr>
+          <tr><th>Max stock price</th><td>${{ '%.2f'|format(dynamic_controls.max_stock_price) }}</td></tr>
+          <tr><th>Min dollar volume</th><td>${{ '{:,.0f}'.format(dynamic_controls.min_dollar_volume) }}</td></tr>
+          <tr><th>Scan limit</th><td>{{ dynamic_controls.scan_limit }}</td></tr>
+          <tr><th>Candidate limit</th><td>{{ dynamic_controls.candidate_limit }}</td></tr>
+          <tr><th>Risk/trade</th><td>{{ '%.2f'|format(dynamic_controls.risk_per_trade_pct * 100) }}%</td></tr>
+          <tr><th>Max position</th><td>{{ '%.2f'|format(dynamic_controls.max_position_pct * 100) }}%</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Market and safety</h2>
+      <table>
+        <tbody>
+          <tr><th>Market</th><td>{% if market_session.is_open %}<span class="ok">Open</span>{% else %}<span class="warn">Closed</span>{% endif %}</td></tr>
+          <tr><th>Session date</th><td>{{ market_session.current_session_date }}</td></tr>
+          <tr><th>Session open</th><td>{{ market_session.current_session_open[:19].replace('T', ' ') }}</td></tr>
+          <tr><th>Session close</th><td>{{ market_session.current_session_close[:19].replace('T', ' ') }}{% if market_session.is_early_close %} <span class="warn">(early close)</span>{% endif %}</td></tr>
+          <tr><th>Next open</th><td>{{ market_session.next_open[:19].replace('T', ' ') if market_session.next_open else '-' }}</td></tr>
+          <tr><th>Buy status</th><td>{% if safety_status.pause_new_buys %}<span class="warn">Paused</span>{% else %}<span class="ok">Active</span>{% endif %}</td></tr>
+          <tr><th>Daily equity anchor</th><td>${{ '%.2f'|format(safety_status.daily_equity_anchor) }}</td></tr>
+          <tr><th>Daily loss</th><td>{{ '%.2f'|format(safety_status.daily_loss_pct) }}%</td></tr>
+          <tr><th>Buy errors</th><td>{{ safety_status.consecutive_buy_errors }}</td></tr>
+        </tbody>
+      </table>
+      {% if safety_status.reasons %}
+      <div style="margin-top: 12px;">
+        {% for reason in safety_status.reasons %}
+        <span class="pill">{{ reason }}</span>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>Scan picks</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th><th>Action</th><th>Score</th><th>Price</th><th>R/R</th><th>Qty</th><th>Why</th><th>Signals</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for c in candidates %}
+          <tr>
+            <td>{{ c.symbol }}</td>
+            <td class="{{ c.action }}">{{ c.action }}</td>
+            <td>{{ '%.2f'|format(c.final_score) }}</td>
+            <td>${{ '%.2f'|format(c.price) }}</td>
+            <td>{{ '%.2f'|format(c.reward_risk) }}</td>
+            <td>{{ c.qty }}</td>
+            <td>{% for r in c.reasons %}<span class="pill">{{ r }}</span>{% endfor %}</td>
+            <td>
+              {% for source, state in c.signal_usage.items() %}
+                <span class="pill">{{ source }}: {{ state }}</span>
+              {% endfor %}
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="8" class="muted">No scan results yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Learning weights</h2>
+      <table>
+        <thead><tr><th>Strategy</th><th>Weight</th><th>Wins</th><th>Losses</th><th>Total Return</th></tr></thead>
+        <tbody>
+          {% for strategy, item in learning.items() %}
+          <tr>
+            <td>{{ strategy }}</td>
+            <td>{{ '%.2f'|format(item.weight) }}</td>
+            <td>{{ item.wins }}</td>
+            <td>{{ item.losses }}</td>
+            <td>{{ '%.2f'|format(item.total_return) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>Signal health</h2>
+      <table>
+        <thead><tr><th>Source</th><th>Status</th><th>Records</th><th>Last success</th><th>Note</th></tr></thead>
+        <tbody>
+          {% for source, item in signal_health.items() %}
+          <tr>
+            <td>{{ source }}</td>
+            <td class="{% if item.status == 'ok' and not item.stale %}ok{% elif item.status == 'disabled' %}muted{% else %}warn{% endif %}">
+              {{ item.status }}{% if item.stale %} / stale{% endif %}{% if item.low_confidence %} / low-confidence{% endif %}{% if item.no_data %} / no-data{% endif %}{% if item.in_backoff %} / retrying-later{% endif %}{% if item.override_mode != 'auto' %} / {{ item.override_mode }}{% endif %}
+            </td>
+            <td>{{ item.records_count }}</td>
+            <td>{{ item.last_success_at[:19].replace('T', ' ') if item.last_success_at else '-' }}</td>
+            <td>
+              {{ item.error_message or ('minimum ' ~ item.minimum_records ~ ' record(s)' if item.low_confidence else ('not configured' if not item.enabled else '')) }}
+              {% if item.next_retry_at %}<br><span class="muted">retry after {{ item.next_retry_at[:19].replace('T', ' ') }}</span>{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Signal diagnostics</h2>
+      <table>
+        <thead><tr><th>Source</th><th>Summary</th><th>Last success</th></tr></thead>
+        <tbody>
+          {% for source, item in signal_diagnostics.items() %}
+          <tr>
+            <td>{{ source }}</td>
+            <td>
+              {{ item.note }}
+              {% if item.error_message %}<br><span class="muted">{{ item.error_message }}</span>{% endif %}
+              {% if item.next_retry_at %}<br><span class="muted">retry after {{ item.next_retry_at[:19].replace('T', ' ') }}</span>{% endif %}
+            </td>
+            <td>{{ item.last_success_at[:19].replace('T', ' ') if item.last_success_at else '-' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>Signal refresh history</h2>
+      <table>
+        <thead><tr><th>Time</th><th>Source</th><th>Status</th><th>Records</th><th>Failures</th></tr></thead>
+        <tbody>
+          {% for item in signal_refresh_history %}
+          <tr>
+            <td>{{ item.created_at[:19].replace('T', ' ') }}</td>
+            <td>{{ item.source }}</td>
+            <td>{{ item.status }}</td>
+            <td>{{ item.records_count }}</td>
+            <td>{{ item.failure_count }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="muted">No signal refresh activity yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Audit trail</h2>
+      <table>
+        <thead><tr><th>Time</th><th>Category</th><th>Severity</th><th>Message</th></tr></thead>
+        <tbody>
+          {% for item in audit_events %}
+          <tr>
+            <td>{{ item.created_at[:19].replace('T', ' ') }}</td>
+            <td>{{ item.category }}</td>
+            <td>{{ item.severity }}</td>
+            <td>
+              {{ item.message }}
+              {% if item.details %}
+              <br><span class="muted">{{ item.details }}</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4" class="muted">No audit events yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>Congress trades under ${{ '%.2f'|format(congress_max_price) }}</h2>
+      <p class="muted">Recent congressional buys and sells currently trading below your congress price cap.</p>
+      <table>
+        <thead><tr><th>Member</th><th>Symbol</th><th>Side</th><th>Current</th><th>Trade Date</th><th>Filed</th></tr></thead>
+        <tbody>
+          {% for item in congress_trades %}
+          <tr>
+            <td>{{ item.member }}</td>
+            <td>{{ item.symbol }}</td>
+            <td>{{ item.side }}</td>
+            <td>{% if item.current_price is not none %}${{ '%.2f'|format(item.current_price) }}{% endif %}</td>
+            <td>{{ item.trade_date }}</td>
+            <td>{{ item.filed_date }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6" class="muted">No congressional trades are cached yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Open positions</h2>
+      <table>
+        <thead><tr><th>Symbol</th><th>Qty</th><th>Entry</th><th>Current</th><th>Peak</th><th>Active Stop</th><th>Trail</th><th>Target</th><th>To Stop</th><th>Unrealized %</th></tr></thead>
+        <tbody>
+          {% for p in positions %}
+          <tr>
+            <td>{{ p.symbol }}</td>
+            <td>{{ p.qty }}</td>
+            <td>${{ '%.2f'|format(p.avg_entry_price) }}</td>
+            <td>${{ '%.2f'|format(p.current_price) }}</td>
+            <td>{% if p.peak_price is defined %}${{ '%.2f'|format(p.peak_price) }}{% else %}-{% endif %}</td>
+            <td>{% if p.active_stop_price is defined %}${{ '%.2f'|format(p.active_stop_price) }}{% else %}-{% endif %}</td>
+            <td>{% if p.trailing_stop_price is defined %}${{ '%.2f'|format(p.trailing_stop_price) }}{% else %}-{% endif %}</td>
+            <td>{% if p.target_price is defined %}${{ '%.2f'|format(p.target_price) }}{% else %}-{% endif %}</td>
+            <td>{% if p.distance_to_stop_pct is defined %}{{ '%.2f'|format(p.distance_to_stop_pct) }}%{% else %}-{% endif %}</td>
+            <td>{{ '%.2f'|format(p.unrealized_pl_pct) }}%</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="10" class="muted">No open positions yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Recent trades</h2>
+      <table>
+        <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Status</th><th>PNL %</th></tr></thead>
+        <tbody>
+          {% for t in trades %}
+          <tr>
+            <td>{{ t.created_at[:19].replace('T', ' ') }}</td>
+            <td>{{ t.symbol }}</td>
+            <td>{{ t.side }}</td>
+            <td>{{ t.qty }}</td>
+            <td>${{ '%.2f'|format(t.price) }}</td>
+            <td>{{ t.status }}</td>
+            <td>{% if t.pnl_pct is not none %}{{ '%.2f'|format(t.pnl_pct) }}%{% endif %}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="7" class="muted">No trades yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+</body>
+</html>

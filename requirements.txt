@@ -1,0 +1,9 @@
+fastapi==0.111.0
+uvicorn==0.40.0
+pydantic==2.12.5
+requests==2.32.5
+Jinja2==3.1.6
+python-dotenv==1.2.1
+pytest==8.4.2
+pypdf==5.4.0
+exchange-calendars==4.13.2

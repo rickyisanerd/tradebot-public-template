@@ -1,0 +1,19 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.pytest_tmp/
+pytest_tmp/
+.codex_tmp*/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Local runtime state
+*.db
+*.sqlite
+*.sqlite3
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
