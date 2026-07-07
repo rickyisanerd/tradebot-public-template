@@ -12,7 +12,12 @@ TradeBot is a Python trading bot for low-priced equities. It can run in demo mod
 - SQLite persistence for trades, positions, learning weights, cached signals, and audit history
 - Dynamic scaling of capital, scan breadth, and risk as equity changes
 - Peak-based trailing stops, optional partial profits, and account-level safety rails
-- FastAPI dashboard and daily email report support
+- Market-regime filter with limited high-conviction longs in weak regimes, plus confirmed inverse-ETF hedging with exposure caps and earnings blackouts
+- Congressional trade auto-discovery from official House and Senate disclosure feeds
+- Analyst consensus checks and exclusion of broad-market or sector ETFs from buy candidates
+- A put-shadow paper evaluator that scores hypothetical put trades so you can judge a bearish strategy before funding it
+- FastAPI dashboard and a holiday-aware daily email report with zero-P&L self-diagnosis
+- Optional E*TRADE mirror that copies fills to a second brokerage account with independent risk caps (preview-only by default)
 
 ## Quick start
 
@@ -64,6 +69,20 @@ python -m tradebot.cli refresh-macro
 python run_tests.py
 ```
 
+### 5. Optional tools
+
+```bash
+# Analyze a running bot's trade history and signal edge (defaults to the
+# local dashboard; point --url or TRADEBOT_DASHBOARD_URL at a deployment)
+python analyze_performance.py
+
+# Interactive lesson on how put options work, with paper examples
+python puts_learn.py
+
+# Obtain and verify E*TRADE OAuth tokens for the mirror feature
+python etrade_smoke.py
+```
+
 ## Broker modes
 
 | Mode | Env value | Keys required |
@@ -113,6 +132,26 @@ Email reporting:
 - `REPORT_SENDER_EMAIL`
 - `REPORT_DASHBOARD_URL`
 
+Regime and hedging:
+
+- `MARKET_REGIME_FILTER`
+- `MARKET_REGIME_ALLOW_LIMITED_LONGS`
+- `INVERSE_CONFIRMATION_HOURS`
+- `MAX_INVERSE_POSITIONS`
+- `MAX_INVERSE_EXPOSURE_PCT`
+- `EARNINGS_BLACKOUT_DAYS`
+- `EXCLUDE_BROAD_MARKET_ETFS`
+
+E*TRADE mirror (optional, disabled by default):
+
+- `ETRADE_MIRROR_ENABLED`
+- `ETRADE_MIRROR_ENV`
+- `ETRADE_ACCOUNT_ID_KEY`
+- `ETRADE_MIRROR_PREVIEW_ONLY`
+- `ETRADE_MIRROR_MAX_ORDER_VALUE`
+- `ETRADE_MIRROR_MAX_TOTAL_CAPITAL`
+- plus consumer key / access token secrets per environment (see `.env.example`)
+
 ## Deploying to Railway
 
 1. Push this repo to GitHub.
@@ -144,6 +183,10 @@ tradebot/
   macro.py
   polygon.py
   email_report.py
+  analyst_consensus.py
+  put_shadow.py
+  etrade.py
+  mirror.py
   mcp_bridge.py
   templates/index.html
 ```

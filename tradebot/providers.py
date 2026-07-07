@@ -12,7 +12,7 @@ import requests
 
 from .config import Settings
 from .models import AccountSnapshot, PositionSnapshot
-from .universe import DEFAULT_UNIVERSE
+from .universe import DEFAULT_UNIVERSE, LIQUID_LARGE_CAP_UNIVERSE
 
 
 class ProviderError(RuntimeError):
@@ -43,7 +43,7 @@ class BaseBroker:
     def latest_prices(self, symbols: List[str]) -> Dict[str, float]:
         raise NotImplementedError
 
-    def buy(self, symbol: str, qty: int, stop_price: Optional[float] = None, target_price: Optional[float] = None) -> dict:
+    def buy(self, symbol: str, qty: float, stop_price: Optional[float] = None, target_price: Optional[float] = None) -> dict:
         raise NotImplementedError
 
     def sell(self, symbol: str, qty: Optional[float] = None) -> dict:
@@ -51,6 +51,18 @@ class BaseBroker:
 
     def recent_filled_sell_orders(self, symbols: List[str]) -> Dict[str, dict]:
         return {}
+
+    def open_exit_orders_for_symbol(self, symbol: str) -> List[dict]:
+        return []
+
+    def submit_protective_exit(
+        self,
+        symbol: str,
+        qty: float,
+        stop_price: float,
+        target_price: Optional[float] = None,
+    ) -> Optional[dict]:
+        return None
 
     def cancel_open_orders_for_symbol(self, symbol: str) -> int:
         return 0
@@ -145,6 +157,7 @@ class DemoBroker(BaseBroker):
             equity=round(equity, 2),
             buying_power=round(float(state["cash"]), 2),
             mode="demo",
+            last_equity=None,
         )
 
     def positions(self) -> List[PositionSnapshot]:
@@ -171,7 +184,7 @@ class DemoBroker(BaseBroker):
             )
         return sorted(positions, key=lambda x: x.market_value, reverse=True)
 
-    def buy(self, symbol: str, qty: int, stop_price: Optional[float] = None, target_price: Optional[float] = None) -> dict:
+    def buy(self, symbol: str, qty: float, stop_price: Optional[float] = None, target_price: Optional[float] = None) -> dict:
         if qty <= 0:
             raise ProviderError("Quantity must be positive.")
         state = self._load()
@@ -233,6 +246,8 @@ class AlpacaBroker(BaseBroker):
     def universe(self) -> List[str]:
         if self.settings.scan_universe:
             return self.settings.scan_universe
+        if self.settings.live_universe_mode != "dynamic":
+            return self.settings.liquid_scan_universe or LIQUID_LARGE_CAP_UNIVERSE
         now = datetime.now(timezone.utc)
         if self._universe_cache and self._universe_cached_at and (now - self._universe_cached_at) < timedelta(hours=6):
             return self._universe_cache
@@ -274,6 +289,7 @@ class AlpacaBroker(BaseBroker):
             equity=float(payload.get("equity", 0)),
             buying_power=float(payload.get("buying_power", 0)),
             mode=self.settings.broker_mode,
+            last_equity=float(payload["last_equity"]) if payload.get("last_equity") not in (None, "") else None,
         )
 
     def positions(self) -> List[PositionSnapshot]:
@@ -329,7 +345,7 @@ class AlpacaBroker(BaseBroker):
                 prices[symbol] = float(price)
         return prices
 
-    def buy(self, symbol: str, qty: int, stop_price: Optional[float] = None, target_price: Optional[float] = None) -> dict:
+    def buy(self, symbol: str, qty: float, stop_price: Optional[float] = None, target_price: Optional[float] = None) -> dict:
         order = {
             "symbol": symbol,
             "qty": qty,
@@ -337,12 +353,15 @@ class AlpacaBroker(BaseBroker):
             "type": "market",
             "time_in_force": "day",
         }
+        whole_share_qty = float(qty).is_integer()
         if (
             self.settings.use_broker_protective_orders
             and stop_price is not None
             and target_price is not None
             and target_price > stop_price
+            and whole_share_qty
         ):
+            order["time_in_force"] = "gtc"
             order["order_class"] = "bracket"
             order["take_profit"] = {"limit_price": round(float(target_price), 2)}
             order["stop_loss"] = {"stop_price": round(float(stop_price), 2)}
@@ -353,11 +372,66 @@ class AlpacaBroker(BaseBroker):
             return self._request("DELETE", f"{self.settings.trading_base_url}/v2/positions/{symbol}")
         order = {
             "symbol": symbol,
-            "qty": int(qty),
+            "qty": qty,
             "side": "sell",
             "type": "market",
             "time_in_force": "day",
         }
+        return self._request("POST", f"{self.settings.trading_base_url}/v2/orders", json=order)
+
+    def open_exit_orders_for_symbol(self, symbol: str) -> List[dict]:
+        payload = self._request(
+            "GET",
+            f"{self.settings.trading_base_url}/v2/orders",
+            params={"status": "open", "limit": 100, "nested": "true", "direction": "desc"},
+        )
+        symbol = symbol.upper()
+        orders: List[dict] = []
+
+        def visit(order: dict) -> None:
+            if str(order.get("symbol", "")).upper() != symbol:
+                return
+            if order.get("side") == "sell":
+                orders.append(order)
+
+        for order in payload if isinstance(payload, list) else []:
+            visit(order)
+            for leg in order.get("legs") or []:
+                visit(leg)
+        return orders
+
+    def submit_protective_exit(
+        self,
+        symbol: str,
+        qty: float,
+        stop_price: float,
+        target_price: Optional[float] = None,
+    ) -> Optional[dict]:
+        if qty <= 0:
+            raise ProviderError("Quantity must be positive.")
+        qty_value = float(qty)
+        whole_share_qty = qty_value.is_integer()
+        rounded_stop = round(float(stop_price), 2)
+        if whole_share_qty and target_price is not None and float(target_price) > rounded_stop:
+            order = {
+                "symbol": symbol,
+                "qty": int(qty_value),
+                "side": "sell",
+                "type": "limit",
+                "time_in_force": "gtc",
+                "order_class": "oco",
+                "take_profit": {"limit_price": round(float(target_price), 2)},
+                "stop_loss": {"stop_price": rounded_stop},
+            }
+        else:
+            order = {
+                "symbol": symbol,
+                "qty": qty,
+                "side": "sell",
+                "type": "stop",
+                "time_in_force": "day",
+                "stop_price": rounded_stop,
+            }
         return self._request("POST", f"{self.settings.trading_base_url}/v2/orders", json=order)
 
     def recent_filled_sell_orders(self, symbols: List[str]) -> Dict[str, dict]:

@@ -4,7 +4,7 @@ import json
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import exchange_calendars as xcals
 import logging
@@ -12,6 +12,7 @@ import pandas as pd
 from zoneinfo import ZoneInfo
 
 from .analytics import compute_metrics
+from .analyst_consensus import AnalystConsensusTracker
 from .congress import CongressTracker
 from .config import Settings
 from .mcp_bridge import analyze as analyze_with_mcp
@@ -50,6 +51,9 @@ class TradingEngine:
     _market_calendar: object = field(init=False, default=None)
     _last_safety_signature: str = field(init=False, default="")
     _last_broker_sync_at: Optional[datetime] = field(init=False, default=None)
+    _signals_paused_market_closed: bool = field(init=False, default=False)
+    _analyst_tracker: Optional[AnalystConsensusTracker] = field(init=False, default=None)
+    failure_callback: Optional[Callable[[str, Exception, Dict[str, object]], None]] = None
 
     def __post_init__(self) -> None:
         if self.polygon is None:
@@ -67,6 +71,8 @@ class TradingEngine:
         if self.settings.is_demo and self.settings.starting_cash > 0:
             self._scale_baseline_equity = float(self.settings.starting_cash)
         self._market_calendar = xcals.get_calendar("XNYS")
+        if self.settings.analyst_consensus_enabled:
+            self._analyst_tracker = AnalystConsensusTracker(self.settings, self.db)
 
     def learning_weights(self) -> Dict[str, float]:
         raw = self.db.learning_weights()
@@ -101,6 +107,15 @@ class TradingEngine:
 
     def _today_et(self) -> str:
         return self._now_utc().astimezone(NY_TZ).date().isoformat()
+
+    def _is_trading_day_today(self) -> bool:
+        """True if today (ET) is an actual NYSE trading session — a weekday
+        that is NOT a market holiday. Lets the daily report distinguish a real
+        $0.00 P&L problem from a legitimately flat closed-market day."""
+        try:
+            return bool(self._market_calendar.is_session(pd.Timestamp(self._today_et())))
+        except Exception:  # noqa: BLE001
+            return self._now_utc().astimezone(NY_TZ).weekday() < 5
 
     def _market_session_status(self, when: Optional[datetime] = None) -> Dict[str, object]:
         moment = when or self._now_utc()
@@ -184,7 +199,7 @@ class TradingEngine:
         if self._override_modes()[source] == "disabled":
             return False
         if source == "congress":
-            return bool(self.settings.congress_report_urls)
+            return bool(self.settings.congress_auto_fetch or self.settings.congress_report_urls)
         if source == "sec":
             return bool(self.settings.sec_user_agent)
         if source == "earnings":
@@ -203,6 +218,129 @@ class TradingEngine:
         if step <= 0:
             return round(value, 2)
         return round(math.ceil(value / step) * step, 2)
+
+    def _price_allowed(self, symbol: str, price: float) -> bool:
+        if self._is_inverse_etf(symbol):
+            return True
+        min_price = max(float(self.settings.min_stock_price), 0.0)
+        max_price = float(self.settings.max_stock_price)
+        if price < min_price:
+            return False
+        if max_price > 0 and price > max_price:
+            return False
+        return True
+
+    def _market_regime_status(self) -> Dict[str, object]:
+        if not self.settings.market_regime_filter:
+            return {
+                "enabled": False,
+                "allow_long_buys": True,
+                "state": "disabled",
+                "reason": "disabled",
+                "symbols": [],
+                "details": [],
+            }
+        symbols = self.settings.market_regime_symbols or ["SPY", "QQQ"]
+        short_window = max(2, int(self.settings.market_regime_short_window))
+        long_window = max(short_window + 1, int(self.settings.market_regime_long_window))
+        request_days = max(long_window + 5, int(long_window * 2.2))
+        try:
+            bars_by_symbol = self._fetch_bars(symbols, request_days)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Market regime fetch failed: %s", exc)
+            bars_by_symbol = {}
+
+        details: List[Dict[str, object]] = []
+        missing = False
+        uptrend_count = 0
+        for symbol in symbols:
+            bars = bars_by_symbol.get(symbol) or []
+            closes = [float(bar["c"]) for bar in bars if bar.get("c") is not None]
+            if len(closes) < long_window:
+                missing = True
+                details.append({"symbol": symbol, "state": "missing", "uptrend": False})
+                continue
+            latest = closes[-1]
+            short_ma = sum(closes[-short_window:]) / short_window
+            long_ma = sum(closes[-long_window:]) / long_window
+            uptrend = latest >= short_ma >= long_ma
+            if uptrend:
+                uptrend_count += 1
+            details.append(
+                {
+                    "symbol": symbol,
+                    "state": "uptrend" if uptrend else "weak",
+                    "uptrend": uptrend,
+                    "latest": round(latest, 2),
+                    "short_ma": round(short_ma, 2),
+                    "long_ma": round(long_ma, 2),
+                }
+            )
+
+        if missing and self.settings.market_regime_block_on_missing:
+            allow_long_buys = False
+            state = "missing"
+            reason = "market regime data unavailable"
+        else:
+            allow_long_buys = bool(details) and uptrend_count == len(details)
+            state = "uptrend" if allow_long_buys else "weak"
+            reason = "broad market uptrend confirmed" if allow_long_buys else "SPY/QQQ trend filter is weak"
+
+        return {
+            "enabled": True,
+            "allow_long_buys": allow_long_buys,
+            "state": state,
+            "reason": reason,
+            "symbols": symbols,
+            "details": details,
+        }
+
+    def _update_regime_persistence(self, market_regime: Dict[str, object], now: Optional[datetime] = None) -> None:
+        """Annotate the regime status with whether inverse hedge entries are
+        confirmed. A single weak reading is often a one-morning whipsaw, so
+        hedges are only allowed once the weak regime has persisted for
+        `inverse_confirmation_hours` (which forces it to span sessions)."""
+        if not market_regime.get("enabled"):
+            market_regime["inverse_buys_confirmed"] = True
+            return
+        now = now or datetime.now(timezone.utc)
+        state = str(market_regime.get("state") or "")
+        if bool(market_regime.get("allow_long_buys")):
+            self.db.set_bot_state("regime_weak_since", "")
+            market_regime["inverse_buys_confirmed"] = False
+            return
+        if state == "missing":
+            # Data outage, not a market signal — keep any running clock but
+            # never confirm hedges on missing data.
+            market_regime["inverse_buys_confirmed"] = False
+            return
+        confirm_hours = max(0.0, float(self.settings.inverse_confirmation_hours))
+        weak_since_raw = self.db.get_bot_state("regime_weak_since") or ""
+        weak_since: Optional[datetime] = None
+        if weak_since_raw:
+            try:
+                weak_since = datetime.fromisoformat(weak_since_raw)
+            except ValueError:
+                weak_since = None
+        if weak_since is None:
+            weak_since = now
+            self.db.set_bot_state("regime_weak_since", now.isoformat())
+        market_regime["inverse_buys_confirmed"] = (now - weak_since) >= timedelta(hours=confirm_hours)
+
+    def _in_earnings_blackout(self, external_inputs: Dict[str, float]) -> bool:
+        days_until = float(external_inputs.get("days_until_earnings", float("inf")))
+        return (
+            self.settings.earnings_blackout_days > 0
+            and float(external_inputs.get("has_upcoming_earnings", 0.0)) > 0
+            and days_until <= self.settings.earnings_blackout_days
+        )
+
+    def _round_share_qty(self, qty: float) -> float:
+        if qty <= 0:
+            return 0.0
+        precision = 6 if self.settings.is_alpaca else 4
+        step = 10 ** precision
+        return math.floor(qty * step) / step
 
     def _capital_step(self) -> float:
         if self._base_max_total_capital <= 1_000:
@@ -283,7 +421,17 @@ class TradingEngine:
     def _execution_safety_status(self, account: Optional[object] = None) -> Dict[str, object]:
         account = account or self.broker.account()
         equity = max(float(account.equity), float(account.cash), 0.0)
-        daily_anchor = self._daily_equity_anchor(equity) if equity > 0 else 0.0
+        local_daily_anchor = self._daily_equity_anchor(equity) if equity > 0 else 0.0
+        broker_daily_anchor = 0.0
+        try:
+            broker_daily_anchor = float(getattr(account, "last_equity", None) or 0.0)
+        except (TypeError, ValueError):
+            broker_daily_anchor = 0.0
+        daily_anchor = broker_daily_anchor if broker_daily_anchor > 0 else local_daily_anchor
+        daily_anchor_source = "broker_previous_close" if broker_daily_anchor > 0 else "local_start_of_day"
+        daily_pnl_amount = equity - daily_anchor if daily_anchor > 0 else 0.0
+        daily_loss_amount = max(0.0, daily_anchor - equity) if daily_anchor > 0 else 0.0
+        daily_profit_amount = max(0.0, daily_pnl_amount)
         daily_loss_pct = max(0.0, (daily_anchor - equity) / daily_anchor) if daily_anchor > 0 else 0.0
         consecutive_buy_errors = self._consecutive_buy_errors()
         reasons: List[str] = []
@@ -294,8 +442,12 @@ class TradingEngine:
             reasons.append("external signals are degraded")
         if self._latest_drawdown_state == "hard":
             reasons.append("hard drawdown throttle is active")
+        if self.settings.daily_loss_limit_dollars > 0 and daily_loss_amount >= self.settings.daily_loss_limit_dollars:
+            reasons.append(f"daily dollar loss limit reached (${daily_loss_amount:.2f})")
         if self.settings.daily_loss_limit_pct > 0 and daily_loss_pct >= self.settings.daily_loss_limit_pct:
             reasons.append(f"daily loss limit reached ({daily_loss_pct * 100:.2f}% of equity)")
+        if self.settings.profit_lock_dollars > 0 and daily_profit_amount >= self.settings.profit_lock_dollars:
+            reasons.append(f"daily profit lock reached (${daily_profit_amount:.2f})")
         if self.settings.max_consecutive_buy_errors > 0 and consecutive_buy_errors >= self.settings.max_consecutive_buy_errors:
             reasons.append(f"consecutive buy errors reached {consecutive_buy_errors}")
         pause_until = self._pdt_pause_until()
@@ -313,6 +465,10 @@ class TradingEngine:
             "pause_new_buys": bool(reasons),
             "reasons": reasons,
             "daily_equity_anchor": round(daily_anchor, 2),
+            "daily_equity_anchor_source": daily_anchor_source,
+            "daily_pnl_amount": round(daily_pnl_amount, 2),
+            "daily_loss_amount": round(daily_loss_amount, 2),
+            "daily_profit_amount": round(daily_profit_amount, 2),
             "daily_loss_pct": round(daily_loss_pct * 100, 2),
             "consecutive_buy_errors": consecutive_buy_errors,
             "drawdown_state": self._latest_drawdown_state,
@@ -349,6 +505,22 @@ class TradingEngine:
 
     def _record_audit_event(self, category: str, severity: str, message: str, details: Optional[Dict[str, object]] = None) -> None:
         self.db.record_audit_event(category, severity, message, details)
+
+    def _notify_failure(self, context: str, exc: Exception, details: Optional[Dict[str, object]] = None) -> None:
+        payload: Dict[str, object] = {
+            "context": context,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+        if details:
+            payload.update(details)
+        if self.failure_callback:
+            try:
+                self.failure_callback(context, exc, details or {})
+                return
+            except Exception:  # noqa: BLE001
+                log.exception("Failure callback failed for %s", context)
+        self._record_audit_event("failure", "error", f"{context} failed", payload)
 
     def _record_safety_transition(self, status: Dict[str, object]) -> None:
         signature = json.dumps(
@@ -523,6 +695,11 @@ class TradingEngine:
                 f"{source} refresh failed",
                 {"source": source, "error_message": str(exc), "next_retry_at": next_retry_at},
             )
+            self._notify_failure(
+                f"{source} signal refresh",
+                exc,
+                {"source": source, "failure_count": failure_count, "next_retry_at": next_retry_at},
+            )
             return []
         self.db.update_signal_status(
             source,
@@ -604,7 +781,6 @@ class TradingEngine:
             "macro": [
                 "days_until_macro_event",
                 "has_near_macro_event",
-                "near_cpi_count",
                 "near_fomc_count",
             ],
         }
@@ -680,14 +856,14 @@ class TradingEngine:
         return sum(float(bar["c"]) * float(bar["v"]) for bar in recent) / len(recent)
 
     def _polygon_universe(self) -> List[str] | None:
-        """Use Polygon daily market summary to discover ALL sub-$10 stocks
-        in a single API call.  Returns None if Polygon is unavailable."""
+        """Use Polygon daily market summary to discover the current stock universe
+        in a single API call. Returns None if Polygon is unavailable."""
         if not self.polygon:
             return None
         try:
             items = self.polygon.sub10_universe(
                 min_price=self.settings.min_stock_price,
-                max_price=self.settings.max_stock_price,
+                max_price=self.settings.max_stock_price if self.settings.max_stock_price > 0 else float("inf"),
                 min_volume=200_000,
             )
         except Exception as exc:  # noqa: BLE001
@@ -699,8 +875,21 @@ class TradingEngine:
         # so keep this reasonable to avoid rate limits and slow scans.
         target_pool = max(self.settings.scan_limit, self.settings.candidate_limit * 4)
         symbols = [item["symbol"] for item in items[:target_pool]]
-        log.info("Polygon discovered %d sub-$10 stocks (using top %d)", len(items), len(symbols))
+        log.info("Polygon discovered %d eligible stocks (using top %d)", len(items), len(symbols))
         return symbols
+
+    # Inverse ETFs grouped by the index they short. Holding two funds from the
+    # same bucket (e.g. SPXS + SPXU) doubles a single bet, not a hedge.
+    _INVERSE_ETF_BUCKETS = {
+        "SH": "SPX",
+        "SPXS": "SPX",
+        "SPXU": "SPX",
+        "PSQ": "NDX",
+        "SQQQ": "NDX",
+        "TECS": "NDX",
+        "DOG": "DJI",
+        "SDOW": "DJI",
+    }
 
     def _is_inverse_etf(self, symbol: str) -> bool:
         """Check if a symbol is in the inverse ETF list."""
@@ -709,11 +898,60 @@ class TradingEngine:
             and symbol.upper() in self.settings.inverse_etfs
         )
 
+    def _is_broad_market_etf(self, symbol: str) -> bool:
+        """Broad-market / index / sector ETFs the bot shouldn't pick as stocks.
+
+        These have no single-name edge — buying them is just full-price beta.
+        Inverse ETFs are handled separately (hedging) and never count here.
+        """
+        return (
+            self.settings.exclude_broad_market_etfs
+            and symbol.upper() in self.settings.broad_market_etfs
+            and not self._is_inverse_etf(symbol)
+        )
+
+    def _inverse_bucket(self, symbol: str) -> str:
+        return self._INVERSE_ETF_BUCKETS.get(symbol.upper(), symbol.upper())
+
+    def _inverse_hedge_headroom(
+        self,
+        symbol: str,
+        held: List[Tuple[str, float]],
+        equity: float,
+    ) -> float:
+        """Dollars still allowed into this inverse ETF given current holdings.
+
+        `held` is (symbol, market_value) for every open position, including
+        buys already placed earlier in the same run. Returns 0 when the buy
+        should be skipped, math.inf when uncapped.
+        """
+        if not self._is_inverse_etf(symbol):
+            return math.inf
+        held_inverse = [(s, mv) for s, mv in held if self._is_inverse_etf(s)]
+        bucket = self._inverse_bucket(symbol)
+        if any(self._inverse_bucket(s) == bucket for s, _mv in held_inverse):
+            return 0.0
+        limit = int(self.settings.max_inverse_positions)
+        if limit > 0 and len({s.upper() for s, _mv in held_inverse}) >= limit:
+            return 0.0
+        cap_pct = float(self.settings.max_inverse_exposure_pct)
+        if cap_pct <= 0:
+            return math.inf
+        return max(0.0, cap_pct * max(equity, 0.0) - sum(mv for _s, mv in held_inverse))
+
     def _candidate_symbol_pool(self) -> List[str]:
         # If user specified a custom universe, honour it.
         if self.settings.scan_universe:
             base = self.settings.scan_universe[: self.settings.scan_limit]
             # Always inject inverse ETFs so the bot can hedge
+            if self.settings.inverse_etfs_enabled:
+                for etf in self.settings.inverse_etfs:
+                    if etf not in base:
+                        base.append(etf)
+            return base
+
+        if self.settings.is_alpaca and self.settings.live_universe_mode != "dynamic":
+            base = self.broker.universe()[: self.settings.scan_limit]
             if self.settings.inverse_etfs_enabled:
                 for etf in self.settings.inverse_etfs:
                     if etf not in base:
@@ -764,10 +1002,8 @@ class TradingEngine:
                 if len(item) < 20:
                     continue
                 price = float(item[-1]["c"])
-                # Inverse ETFs are exempt from the price range filter
-                if not self._is_inverse_etf(symbol):
-                    if not (self.settings.min_stock_price <= price <= self.settings.max_stock_price):
-                        continue
+                if not self._price_allowed(symbol, price):
+                    continue
                 avg_dollar_volume = self._avg_dollar_volume_from_bars(item)
                 if avg_dollar_volume < baseline_liquidity:
                     continue
@@ -788,15 +1024,22 @@ class TradingEngine:
                     pool.append(etf)
         return pool
 
-    def _candidate_from_bars(self, symbol: str, bars: List[dict], buying_power: float) -> Candidate | None:
+    def _candidate_from_bars(
+        self,
+        symbol: str,
+        bars: List[dict],
+        buying_power: float,
+        market_regime: Optional[Dict[str, object]] = None,
+    ) -> Candidate | None:
         if len(bars) < 30:
             return None
         metrics = compute_metrics(bars)
         price = metrics["latest"]
-        # Inverse ETFs are exempt from the price range filter
-        if not self._is_inverse_etf(symbol):
-            if not (self.settings.min_stock_price <= price <= self.settings.max_stock_price):
-                return None
+        if not self._price_allowed(symbol, price):
+            return None
+        # Don't pick broad-market/index/sector ETFs as stocks — no edge there.
+        if self._is_broad_market_etf(symbol):
+            return None
 
         stop_from_atr = price - (metrics["atr"] * 1.6)
         stop_from_pct = price * (1 - self.settings.stop_loss_pct)
@@ -808,6 +1051,38 @@ class TradingEngine:
         reward_risk = reward / risk
 
         external_inputs, signal_usage = self._external_signal_controls(symbol)
+        market_regime = market_regime or self._market_regime_status()
+        if market_regime.get("enabled"):
+            market_allows_longs = bool(market_regime.get("allow_long_buys"))
+            signal_usage["market_regime"] = str(market_regime.get("state") or "unknown")
+            metrics["market_regime_uptrend"] = 1.0 if market_allows_longs else 0.0
+            metrics["market_regime_blocked"] = 0.0
+        analyst_snapshot = None
+        if self._analyst_tracker is not None:
+            metrics["analyst_target_upside_pct"] = 0.0
+            metrics["analyst_consensus_blocked"] = 0.0
+            metrics["analyst_consensus_buy_signal"] = 0.0
+            metrics["analyst_consensus_hold_signal"] = 0.0
+            metrics["analyst_consensus_sell_signal"] = 0.0
+            if symbol.upper() in self.settings.analyst_consensus_skip_symbols:
+                signal_usage["analyst_consensus"] = "skipped"
+            else:
+                analyst_snapshot = self._analyst_tracker.get(symbol)
+            if analyst_snapshot:
+                consensus = str(analyst_snapshot.get("consensus", "")).strip()
+                normalized_consensus = consensus.lower()
+                upside_pct = float(analyst_snapshot.get("target_upside_pct", 0.0) or 0.0)
+                metrics["analyst_target_upside_pct"] = upside_pct
+                signal_usage["analyst_consensus"] = consensus
+                if normalized_consensus in {"buy", "strong buy"}:
+                    metrics["analyst_consensus_buy_signal"] = 1.0
+                elif normalized_consensus == "hold":
+                    metrics["analyst_consensus_hold_signal"] = 1.0
+                elif normalized_consensus in {"sell", "strong sell"}:
+                    metrics["analyst_consensus_sell_signal"] = 1.0
+            elif symbol.upper() not in self.settings.analyst_consensus_skip_symbols:
+                signal_usage["analyst_consensus"] = "unavailable"
+
         analysis_input = dict(metrics)
         analysis_input.update(
             {
@@ -854,6 +1129,7 @@ class TradingEngine:
             risk_per_trade_pct = self.settings.risk_per_trade_pct
             max_position_pct = self.settings.max_position_pct
 
+        limited_long_by_regime = False
         action = "watch"
         if (
             final_score >= 55
@@ -865,14 +1141,88 @@ class TradingEngine:
             action = "buy"
             reasons.insert(0, "decision support, liquidity, and reward/risk all cleared the bar")
 
+        if (
+            action == "buy"
+            and market_regime.get("enabled")
+            and not bool(market_regime.get("allow_long_buys"))
+            and not self._is_inverse_etf(symbol)
+        ):
+            if (
+                self.settings.market_regime_allow_limited_longs
+                and final_score >= self.settings.market_regime_limited_long_min_score
+            ):
+                limited_long_by_regime = True
+                metrics["market_regime_blocked"] = 0.5
+                signal_usage["market_regime"] = f"{signal_usage.get('market_regime', 'unknown')}-limited"
+                reasons.insert(0, f"market regime caution: reduced-size starter allowed despite {market_regime.get('reason')}")
+            else:
+                action = "watch"
+                metrics["market_regime_blocked"] = 1.0
+                reasons.insert(0, f"market regime filter: {market_regime.get('reason')}")
+
+        if (
+            action == "buy"
+            and self._is_inverse_etf(symbol)
+            and market_regime.get("enabled")
+            and not bool(market_regime.get("inverse_buys_confirmed", True))
+        ):
+            action = "watch"
+            reasons.insert(0, "inverse hedge awaiting multi-session downtrend confirmation")
+
+        if action == "buy" and self._in_earnings_blackout(external_inputs):
+            action = "watch"
+            reasons.insert(
+                0,
+                f"earnings expected within {int(float(external_inputs.get('days_until_earnings', 0)))} day(s) - blackout window",
+            )
+
+        if limited_long_by_regime and action == "buy":
+            risk_per_trade_pct = min(risk_per_trade_pct, self.settings.market_regime_limited_long_risk_pct)
+            max_position_pct = min(max_position_pct, self.settings.market_regime_limited_long_max_position_pct)
+
         risk_budget = max(50.0, buying_power * risk_per_trade_pct)
         position_cap = max(100.0, buying_power * max_position_pct)
-        qty_from_risk = int(risk_budget / risk)
-        qty_from_value = int(position_cap / price)
-        qty = max(0, min(qty_from_risk, qty_from_value))
+        qty_from_risk = risk_budget / risk
+        qty_from_value = position_cap / price
+        qty = self._round_share_qty(max(0.0, min(qty_from_risk, qty_from_value)))
 
         if qty <= 0:
             action = "watch"
+
+        if action == "buy" and self._analyst_tracker is not None and not self._is_inverse_etf(symbol):
+            require_strong_buy = self.settings.analyst_consensus_require_strong_buy
+            if analyst_snapshot:
+                consensus = str(analyst_snapshot.get("consensus", "")).strip()
+                normalized_consensus = consensus.lower()
+                upside_pct = float(analyst_snapshot.get("target_upside_pct", 0.0) or 0.0)
+                if normalized_consensus in {"sell", "strong sell"}:
+                    action = "watch"
+                    metrics["analyst_consensus_blocked"] = 1.0
+                    reasons.insert(0, f"analyst consensus is {consensus}, so the bot is standing down")
+                elif self.settings.analyst_consensus_block_hold and normalized_consensus == "hold":
+                    action = "watch"
+                    metrics["analyst_consensus_blocked"] = 1.0
+                    reasons.insert(0, "analyst consensus is Hold, so the bot is standing down")
+                elif require_strong_buy and normalized_consensus != "strong buy":
+                    action = "watch"
+                    metrics["analyst_consensus_blocked"] = 1.0
+                    reasons.insert(0, f"analyst consensus is {consensus}; only Strong Buy names have shown a live edge")
+                elif (
+                    self.settings.analyst_consensus_min_upside_pct > 0
+                    and upside_pct < self.settings.analyst_consensus_min_upside_pct
+                ):
+                    action = "watch"
+                    metrics["analyst_consensus_blocked"] = 1.0
+                    reasons.insert(
+                        0,
+                        f"analyst upside is only {upside_pct:.2f}%, below the {self.settings.analyst_consensus_min_upside_pct:.2f}% minimum",
+                    )
+                elif normalized_consensus in {"buy", "strong buy"}:
+                    reasons.insert(0, f"analyst consensus is {consensus}")
+            elif require_strong_buy:
+                action = "watch"
+                metrics["analyst_consensus_blocked"] = 1.0
+                reasons.insert(0, "no analyst consensus available; Strong Buy is required for new buys")
 
         return Candidate(
             symbol=symbol,
@@ -927,6 +1277,11 @@ class TradingEngine:
         except ProviderError:
             self.db.record_scan(self.settings.broker_mode, self.broker.name, [])
             return []
+        # Check the regime BEFORE the big candidate bar fetch: the ~200-symbol
+        # concurrent burst can rate-limit the data API, and a 429 on SPY/QQQ
+        # here reads as regime "missing", which blocks every long buy.
+        market_regime = self._market_regime_status()
+        self._update_regime_persistence(market_regime)
         bars = self._fetch_bars(symbols, self.settings.lookback_days)
         if not bars:
             log.warning("No bar data returned for %d symbols", len(symbols))
@@ -937,7 +1292,7 @@ class TradingEngine:
             item = bars.get(symbol)
             if not item:
                 continue
-            candidate = self._candidate_from_bars(symbol, item, account.buying_power)
+            candidate = self._candidate_from_bars(symbol, item, account.buying_power, market_regime=market_regime)
             if candidate:
                 candidates.append(candidate)
         candidates.sort(key=lambda x: (x.action == "buy", x.final_score, x.reward_risk), reverse=True)
@@ -984,7 +1339,7 @@ class TradingEngine:
 
     def refresh_macro_events(self) -> List[dict]:
         def run() -> List[dict]:
-            tracker = MacroTracker(self.settings, polygon_client=self.polygon)
+            tracker = MacroTracker(self.settings)
             events = [event.__dict__ for event in tracker.refresh()]
             self.db.replace_macro_events(events)
             return events
@@ -1009,6 +1364,222 @@ class TradingEngine:
         percent_stop = round(entry_price * (1 - self.settings.stop_loss_pct), 2)
         return max(float(stored_stop_price), percent_stop)
 
+    def _daily_loss_liquidation_reason(self, account: object) -> str:
+        if not self.settings.liquidate_on_daily_loss:
+            return ""
+        if not self.settings.is_demo and self._market_is_closed():
+            return ""
+        status = self._execution_safety_status(account)
+        daily_loss_amount = float(status.get("daily_loss_amount", 0.0) or 0.0)
+        daily_loss_pct = float(status.get("daily_loss_pct", 0.0) or 0.0) / 100.0
+        if self.settings.daily_loss_limit_dollars > 0 and daily_loss_amount >= self.settings.daily_loss_limit_dollars:
+            return f"daily loss limit (${daily_loss_amount:.2f})"
+        if self.settings.daily_loss_limit_pct > 0 and daily_loss_pct >= self.settings.daily_loss_limit_pct:
+            return f"daily loss limit ({daily_loss_pct * 100:.2f}%)"
+        return ""
+
+    def _open_exit_order_has_stop_at_or_above(self, orders: List[dict], stop_price: float) -> bool:
+        best_stop = self._best_open_exit_stop_price(orders)
+        return best_stop is not None and best_stop >= stop_price - 0.01
+
+    def _best_open_exit_stop_price(self, orders: List[dict]) -> Optional[float]:
+        best_stop: Optional[float] = None
+        for order in orders:
+            raw_stop = order.get("stop_price")
+            if raw_stop in (None, ""):
+                continue
+            try:
+                stop = float(raw_stop)
+            except (TypeError, ValueError):
+                continue
+            best_stop = stop if best_stop is None else max(best_stop, stop)
+        return best_stop
+
+    def _protective_stop_replace_min_step(self, stop_price: float) -> float:
+        pct = max(float(self.settings.protective_stop_replace_min_step_pct), 0.0)
+        return max(0.01, round(float(stop_price) * pct, 2))
+
+    @staticmethod
+    def _order_status_is_filled(status: object) -> bool:
+        return str(status or "").strip().lower() == "filled"
+
+    @staticmethod
+    def _stop_price_above_market_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "stop price must be less than current price" in message
+
+    def _ensure_protective_exit_order(
+        self,
+        position: object,
+        stop_price: float,
+        target_price: float,
+        current_price: float,
+        meta: Optional[Dict[str, object]],
+    ) -> Optional[dict]:
+        if not (self.settings.is_alpaca and self.settings.use_broker_protective_orders):
+            return None
+        market_session = self._market_session_status()
+        if (
+            self.broker.name == "alpaca"
+            and not bool(market_session["is_open"])
+            and self._now_utc() >= market_session["current_session_close"]
+        ):
+            self._record_audit_event(
+                "broker",
+                "info",
+                "Protective exit deferred until next session",
+                {
+                    "symbol": position.symbol,
+                    "stop_price": stop_price,
+                    "target_price": target_price,
+                    "current_session_close": market_session["current_session_close"].isoformat(),
+                    "next_open": market_session["next_open"].isoformat()
+                    if isinstance(market_session["next_open"], datetime)
+                    else None,
+                },
+            )
+            return None
+        actionable_price = current_price
+        try:
+            latest = self.broker.latest_prices([position.symbol]).get(position.symbol)
+            if latest:
+                actionable_price = float(latest)
+        except Exception:  # noqa: BLE001
+            actionable_price = current_price
+        if actionable_price <= stop_price:
+            self._record_audit_event(
+                "broker",
+                "warning",
+                "Protective stop already breached",
+                {"symbol": position.symbol, "stop_price": stop_price, "current_price": actionable_price},
+            )
+            return self._sell_position(position, actionable_price, "protective stop already breached", meta)
+        try:
+            open_orders = self.broker.open_exit_orders_for_symbol(position.symbol)
+            if self._open_exit_order_has_stop_at_or_above(open_orders, stop_price):
+                return None
+            existing_stop = self._best_open_exit_stop_price(open_orders)
+            if existing_stop is not None:
+                min_step = self._protective_stop_replace_min_step(stop_price)
+                if stop_price - existing_stop < min_step:
+                    self._record_audit_event(
+                        "broker",
+                        "info",
+                        "Protective stop ratchet deferred",
+                        {
+                            "symbol": position.symbol,
+                            "existing_stop_price": existing_stop,
+                            "desired_stop_price": stop_price,
+                            "min_step": min_step,
+                        },
+                    )
+                    return None
+            if open_orders:
+                self.broker.cancel_open_orders_for_symbol(position.symbol)
+            result = self.broker.submit_protective_exit(position.symbol, position.qty, stop_price, target_price)
+        except ProviderError as exc:
+            if self._stop_price_above_market_error(exc):
+                try:
+                    latest = self.broker.latest_prices([position.symbol]).get(position.symbol)
+                    if latest:
+                        actionable_price = float(latest)
+                except Exception:  # noqa: BLE001
+                    actionable_price = current_price
+                self._record_audit_event(
+                    "broker",
+                    "warning",
+                    "Protective stop rejected because stop was already breached",
+                    {
+                        "symbol": position.symbol,
+                        "stop_price": stop_price,
+                        "target_price": target_price,
+                        "current_price": actionable_price,
+                        "error": str(exc),
+                    },
+                )
+                return self._sell_position(position, actionable_price, "protective stop already breached", meta)
+            self._record_audit_event(
+                "broker",
+                "error",
+                "Protective exit order failed",
+                {"symbol": position.symbol, "stop_price": stop_price, "target_price": target_price, "error": str(exc)},
+            )
+            self._notify_failure(
+                "protective exit order",
+                exc,
+                {"symbol": position.symbol, "stop_price": stop_price, "target_price": target_price},
+            )
+            return None
+        if result:
+            self._record_audit_event(
+                "broker",
+                "info",
+                "Protective exit order submitted",
+                {
+                    "symbol": position.symbol,
+                    "stop_price": stop_price,
+                    "target_price": target_price,
+                    "status": result.get("status", ""),
+                    "order_class": result.get("order_class", ""),
+                },
+            )
+        return None
+
+    def _sell_position(self, position: object, current: float, note: str, meta: Optional[Dict[str, object]]) -> Optional[dict]:
+        try:
+            if self.settings.is_alpaca and self.settings.use_broker_protective_orders:
+                self.broker.cancel_open_orders_for_symbol(position.symbol)
+            result = self.broker.sell(position.symbol, position.qty)
+        except ProviderError as exc:
+            self.db.record_trade(position.symbol, "sell", position.qty, current, "error", str(exc))
+            self._notify_failure("position sell", exc, {"symbol": position.symbol, "note": note})
+            return None
+        raw_qty = result.get("qty")
+        raw_price = result.get("filled_avg_price")
+        status = result.get("status", "submitted")
+        recorded_qty = float(raw_qty) if raw_qty not in (None, "") else float(position.qty)
+        recorded_price = float(raw_price) if raw_price not in (None, "") else float(current)
+        if not self._order_status_is_filled(status):
+            if meta:
+                self.db.set_exit_pending(position.symbol, True)
+            self.db.record_trade(
+                position.symbol,
+                "sell",
+                recorded_qty,
+                recorded_price,
+                str(status or "submitted"),
+                f"{note} (exit pending)",
+            )
+            self._record_audit_event(
+                "broker",
+                "info",
+                "Exit order submitted and pending fill",
+                {"symbol": position.symbol, "qty": recorded_qty, "price": recorded_price, "status": status, "note": note},
+            )
+            return {"symbol": position.symbol, "note": f"{note} (exit pending)", "status": str(status or "submitted")}
+        closed = self.db.close_position_meta(position.symbol) if meta else None
+        entry = float(closed["entry_price"]) if closed else position.avg_entry_price
+        pnl_pct = ((recorded_price - entry) / entry) * 100 if entry else 0.0
+        pnl_amount = (recorded_price - entry) * recorded_qty
+        analysis = closed["analysis"] if closed else (meta.get("analysis", {}) if meta else {})
+        self.db.record_trade(
+            position.symbol,
+            "sell",
+            recorded_qty,
+            recorded_price,
+            "filled",
+            note,
+            pnl_pct,
+            analysis,
+            pnl_amount,
+        )
+        if analysis:
+            self.db.update_learning(analysis, pnl_pct)
+            log.info("Learning updated for %s: pnl=%.2f%% analysis=%s", position.symbol, pnl_pct, analysis)
+        else:
+            log.warning("No analysis stored for %s - learning skipped", position.symbol)
+        return {"symbol": position.symbol, "pnl_pct": round(pnl_pct, 2), "note": note}
+
     def reconcile_broker_state(self) -> List[dict]:
         tracked = {item["symbol"]: item for item in self.db.all_position_meta()}
         live_positions = {p.symbol: p for p in self.broker.positions()}
@@ -1027,6 +1598,16 @@ class TradingEngine:
                 notes.append({"symbol": symbol, "note": "reconciled external position"})
                 mismatches.append({"symbol": symbol, "type": "missing_meta"})
                 continue
+            if bool(meta.get("exit_pending")):
+                try:
+                    open_orders = self.broker.open_exit_orders_for_symbol(symbol)
+                except ProviderError:
+                    open_orders = []
+                if not open_orders:
+                    self.db.set_exit_pending(symbol, False)
+                    meta["exit_pending"] = 0
+                    notes.append({"symbol": symbol, "note": "cleared stale pending exit"})
+                    mismatches.append({"symbol": symbol, "type": "stale_exit_pending"})
             if abs(float(meta["qty"]) - float(position.qty)) > 1e-9 or abs(float(meta["entry_price"]) - float(position.avg_entry_price)) > 1e-9:
                 self.db.open_position_meta(
                     symbol,
@@ -1084,9 +1665,12 @@ class TradingEngine:
         broker_notes: List[dict] = []
         if self.settings.is_alpaca:
             broker_notes = self.reconcile_broker_state()
-        prices = self.broker.latest_prices([p.symbol for p in self.broker.positions()])
+        positions = self.broker.positions()
+        prices = self.broker.latest_prices([p.symbol for p in positions])
+        daily_liquidation_reason = self._daily_loss_liquidation_reason(self.broker.account())
         sold: List[dict] = list(broker_notes)
-        for position in self.broker.positions():
+        rotation_market_open: Optional[bool] = None
+        for position in positions:
             meta = self.db.get_position_meta(position.symbol)
             if not meta:
                 continue
@@ -1098,15 +1682,51 @@ class TradingEngine:
 
             held_days = self._held_days(str(meta["opened_at"]))
 
+            if daily_liquidation_reason:
+                sold_item = self._sell_position(position, current, daily_liquidation_reason, meta)
+                if sold_item:
+                    sold.append(sold_item)
+                continue
+
+            # Rotate out positions the exclusion list would refuse to buy today
+            # (legacy broad-market ETFs bought before the exclusion deployed).
+            # Held >= 1 day so the sell can never count as a PDT day trade.
+            if (
+                self.settings.exclude_broad_market_etfs
+                and position.symbol.upper() in self.settings.broad_market_etfs
+                and not self._is_inverse_etf(position.symbol)
+                and held_days >= 1
+            ):
+                if rotation_market_open is None:
+                    rotation_market_open = self.settings.is_demo or not self._market_is_closed()
+                if rotation_market_open:
+                    sold_item = self._sell_position(
+                        position, current, "rotating out of excluded broad-market ETF", meta
+                    )
+                    if sold_item:
+                        sold.append(sold_item)
+                    continue
+
+            target_price = float(meta["target_price"])
+            if target_price > 0 and current >= target_price and held_days >= self.settings.min_hold_days:
+                sold_item = self._sell_position(position, current, "target hit", meta)
+                if sold_item:
+                    sold.append(sold_item)
+                continue
+
             # --- Partial profit-taking ---
             if (
                 self.settings.partial_profit_enabled
                 and not bool(meta.get("partial_profit_taken"))
                 and held_days >= self.settings.min_hold_days
                 and gain_pct >= self.settings.partial_profit_pct
-                and position.qty >= 2
+                and position.qty >= 0.01
             ):
-                sell_qty = max(1, int(position.qty * self.settings.partial_sell_fraction))
+                sell_qty = self._round_share_qty(max(0.01, position.qty * self.settings.partial_sell_fraction))
+                if sell_qty >= position.qty:
+                    sell_qty = self._round_share_qty(max(0.0, position.qty - 0.01))
+                if sell_qty <= 0:
+                    continue
                 remaining_qty = position.qty - sell_qty
                 try:
                     if self.settings.is_alpaca and self.settings.use_broker_protective_orders:
@@ -1114,6 +1734,7 @@ class TradingEngine:
                     result = self.broker.sell(position.symbol, sell_qty)
                 except ProviderError as exc:
                     log.warning("Partial profit sell failed for %s: %s", position.symbol, exc)
+                    self._notify_failure("partial profit sell", exc, {"symbol": position.symbol})
                 else:
                     raw_price = result.get("filled_avg_price")
                     recorded_price = float(raw_price) if raw_price not in (None, "") else float(current)
@@ -1130,10 +1751,10 @@ class TradingEngine:
                     if entry_price > float(meta["stop_price"]):
                         self.db.update_stop_price(position.symbol, entry_price)
                     log.info(
-                        "Partial profit: sold %d of %s at $%.2f (+%.1f%%), %d shares remain at breakeven stop",
+                        "Partial profit: sold %.4f of %s at $%.2f (+%.1f%%), %.4f shares remain at breakeven stop",
                         sell_qty, position.symbol, recorded_price, pnl_pct, remaining_qty,
                     )
-                    sold.append({"symbol": position.symbol, "pnl_pct": round(pnl_pct, 2), "note": f"partial profit ({sell_qty} shares)"})
+                    sold.append({"symbol": position.symbol, "pnl_pct": round(pnl_pct, 2), "note": f"partial profit ({sell_qty:.4f} shares)"})
                 continue  # skip full-sell check this cycle, re-evaluate next cycle
 
             should_sell = False
@@ -1169,45 +1790,19 @@ class TradingEngine:
                 should_sell = True
                 note = "loss cap"
             if should_sell:
-                try:
-                    if self.settings.is_alpaca and self.settings.use_broker_protective_orders:
-                        self.broker.cancel_open_orders_for_symbol(position.symbol)
-                    result = self.broker.sell(position.symbol, position.qty)
-                except ProviderError as exc:
-                    self.db.record_trade(position.symbol, "sell", position.qty, current, "error", str(exc))
-                    continue
-                raw_qty = result.get("qty")
-                raw_price = result.get("filled_avg_price")
-                status = result.get("status", "submitted")
-                recorded_qty = float(raw_qty) if raw_qty not in (None, "") else float(position.qty)
-                recorded_price = float(raw_price) if raw_price not in (None, "") else float(current)
-                # Alpaca usually returns "submitted" / "pending_new" rather
-                # than "filled" synchronously.  Close the position meta and
-                # update learning immediately so weights don't stall.  The
-                # reconciliation path will catch any edge cases.
-                closed = self.db.close_position_meta(position.symbol)
-                entry = float(closed["entry_price"]) if closed else position.avg_entry_price
-                pnl_pct = ((recorded_price - entry) / entry) * 100 if entry else 0.0
-                pnl_amount = (recorded_price - entry) * recorded_qty
-                analysis = closed["analysis"] if closed else {}
-                effective_status = "filled" if status in {"filled", "submitted", "pending_new", "accepted"} else status
-                self.db.record_trade(
-                    position.symbol,
-                    "sell",
-                    recorded_qty,
-                    recorded_price,
-                    effective_status,
-                    note,
-                    pnl_pct,
-                    analysis,
-                    pnl_amount,
+                sold_item = self._sell_position(position, current, note, meta)
+                if sold_item:
+                    sold.append(sold_item)
+            else:
+                sold_item = self._ensure_protective_exit_order(
+                    position,
+                    effective_stop_price,
+                    target_price,
+                    current,
+                    meta,
                 )
-                if analysis:
-                    self.db.update_learning(analysis, pnl_pct)
-                    log.info("Learning updated for %s: pnl=%.2f%% analysis=%s", position.symbol, pnl_pct, analysis)
-                else:
-                    log.warning("No analysis stored for %s — learning skipped", position.symbol)
-                sold.append({"symbol": position.symbol, "pnl_pct": round(pnl_pct, 2), "note": note})
+                if sold_item:
+                    sold.append(sold_item)
         return sold
 
     def _position_display_rows(self) -> List[Dict[str, object]]:
@@ -1290,7 +1885,11 @@ class TradingEngine:
         baseline_equity = self._scaling_baseline_equity(max(float(account.equity), float(account.cash), 0.0))
         peak_equity = max(self._load_peak_equity(), float(account.equity), baseline_equity)
         total_pnl = realized_pnl + unrealized_pnl
-        total_return_pct = ((float(account.equity) - baseline_equity) / baseline_equity * 100) if baseline_equity > 0 else 0.0
+        tracked_basis = float(account.equity) - total_pnl
+        if tracked_basis > 0:
+            total_return_pct = total_pnl / tracked_basis * 100
+        else:
+            total_return_pct = ((float(account.equity) - baseline_equity) / baseline_equity * 100) if baseline_equity > 0 else 0.0
         open_positions.sort(key=lambda item: float(item["pnl_amount"]), reverse=True)
         winning_positions = [item for item in open_positions if float(item["pnl_amount"]) > 0]
         losing_positions = [item for item in open_positions if float(item["pnl_amount"]) < 0]
@@ -1301,6 +1900,7 @@ class TradingEngine:
             "total_pnl": round(total_pnl, 2),
             "total_return_pct": round(total_return_pct, 2),
             "baseline_equity": round(baseline_equity, 2),
+            "tracked_basis": round(tracked_basis, 2),
             "peak_equity": round(peak_equity, 2),
             "open_cost_basis": round(open_cost_basis, 2),
             "open_market_value": round(open_cost_basis + unrealized_pnl, 2),
@@ -1318,13 +1918,19 @@ class TradingEngine:
             return []
         positions = self.broker.positions()
         existing = {p.symbol for p in positions}
-        # Rebuy cooldown: don't re-buy stocks we recently sold at a loss
-        recently_sold = self.db.recently_sold_symbols(self.settings.rebuy_cooldown_hours)
+        recently_sold_losses = self.db.recently_sold_symbols(self.settings.rebuy_cooldown_hours)
+        recently_sold_any = (
+            self.db.recently_sold_symbols(self.settings.rebuy_after_sell_cooldown_hours)
+            if self.settings.rebuy_after_sell_cooldown_hours > 0
+            else {}
+        )
         account = self.broker.account()
         bought: List[dict] = []
         open_position_limit = self.settings.max_open_positions or (len(positions) + self.settings.max_new_positions_per_run)
         slots = min(self.settings.max_new_positions_per_run, max(0, open_position_limit - len(positions)))
         cash_left = account.buying_power
+        if self.settings.cash_buffer_pct > 0:
+            cash_left = max(0.0, cash_left - account.equity * self.settings.cash_buffer_pct)
         deployed_capital = sum(p.market_value for p in positions)
         capital_limit = self.settings.max_total_capital if self.settings.max_total_capital > 0 else max(account.equity, deployed_capital + cash_left)
         capital_left = max(0.0, capital_limit - deployed_capital)
@@ -1337,23 +1943,43 @@ class TradingEngine:
             effective_max_position_pct = self.settings.max_position_pct
         risk_budget = max(50.0, account.equity * effective_risk_per_trade_pct)
         position_cap = max(100.0, account.equity * effective_max_position_pct)
+        held_values: List[Tuple[str, float]] = [(p.symbol, float(p.market_value)) for p in positions]
         for candidate in candidates:
             if slots <= 0:
                 break
             if candidate.action != "buy" or candidate.symbol in existing:
                 continue
-            # Skip stocks we recently sold at a loss — avoid buy/sell loops
-            sold_info = recently_sold.get(candidate.symbol)
+            sold_info = recently_sold_any.get(candidate.symbol)
+            if sold_info:
+                log.info(
+                    "Skipping %s - sold recently within %dh cooldown",
+                    candidate.symbol,
+                    self.settings.rebuy_after_sell_cooldown_hours,
+                )
+                continue
+            # Longer cooldown for loss sells to avoid buy/sell loops.
+            sold_info = recently_sold_losses.get(candidate.symbol)
             if sold_info:
                 sold_pnl = sold_info.get("pnl_pct") or 0
                 if sold_pnl < 0:
                     log.info(
-                        "Skipping %s — sold at %.1f%% within %dh cooldown",
+                        "Skipping %s - sold at %.1f%% within %dh cooldown",
                         candidate.symbol, sold_pnl, self.settings.rebuy_cooldown_hours,
                     )
                     continue
-            max_affordable_qty = int(min(cash_left, capital_left) / candidate.price) if candidate.price > 0 else 0
+            max_affordable_qty = self._round_share_qty(min(cash_left, capital_left) / candidate.price) if candidate.price > 0 else 0.0
             qty = min(candidate.qty, max_affordable_qty)
+            if self._is_inverse_etf(candidate.symbol):
+                headroom = self._inverse_hedge_headroom(candidate.symbol, held_values, account.equity)
+                if headroom <= 0:
+                    log.info(
+                        "Skipping %s - inverse hedge limits reached (bucket, count, or %.0f%% exposure cap)",
+                        candidate.symbol,
+                        self.settings.max_inverse_exposure_pct * 100,
+                    )
+                    continue
+                if candidate.price > 0 and math.isfinite(headroom):
+                    qty = min(qty, self._round_share_qty(headroom / candidate.price))
             est_cost = qty * candidate.price
             if qty <= 0 or est_cost > cash_left or est_cost > capital_left:
                 continue
@@ -1367,12 +1993,33 @@ class TradingEngine:
             except ProviderError as exc:
                 self.db.record_trade(candidate.symbol, "buy", qty or candidate.qty, candidate.price, "error", str(exc), analysis=candidate.analyst_scores)
                 continue
-            fill_price = float(result.get("filled_avg_price") or candidate.price)
+            status = str(result.get("status", "submitted") or "submitted")
+            raw_fill_price = result.get("filled_avg_price")
+            raw_filled_qty = result.get("filled_qty") or result.get("qty")
+            if not self._order_status_is_filled(status) or raw_fill_price in (None, ""):
+                recorded_qty = float(raw_filled_qty) if raw_filled_qty not in (None, "") else float(qty)
+                self.db.record_trade(
+                    candidate.symbol,
+                    "buy",
+                    recorded_qty,
+                    candidate.price,
+                    status,
+                    "entry pending",
+                    analysis=candidate.analyst_scores,
+                )
+                bought.append({"symbol": candidate.symbol, "qty": recorded_qty, "price": candidate.price, "status": status})
+                held_values.append((candidate.symbol, est_cost))
+                cash_left -= est_cost
+                capital_left -= est_cost
+                slots -= 1
+                continue
+            fill_price = float(raw_fill_price)
             applied_stop_price = self._loss_stop_price(fill_price, candidate.stop_price)
-            filled_qty = float(result.get("qty", qty))
-            self.db.record_trade(candidate.symbol, "buy", filled_qty, fill_price, result.get("status", "submitted"), "entry", analysis=candidate.analyst_scores)
+            filled_qty = float(raw_filled_qty) if raw_filled_qty not in (None, "") else float(qty)
+            self.db.record_trade(candidate.symbol, "buy", filled_qty, fill_price, status, "entry", analysis=candidate.analyst_scores)
             self.db.open_position_meta(candidate.symbol, filled_qty, fill_price, applied_stop_price, candidate.target_price, candidate.analyst_scores)
             bought.append({"symbol": candidate.symbol, "qty": filled_qty, "price": fill_price})
+            held_values.append((candidate.symbol, est_cost))
             cash_left -= est_cost
             capital_left -= est_cost
             slots -= 1
@@ -1465,71 +2112,197 @@ class TradingEngine:
     # and feed the outcome back into the learning weights, even for
     # stocks we only watched but didn't buy.
     # ------------------------------------------------------------------
-    def _retroactive_scan_learning(self) -> int:
-        """Review the last scan's 'buy' picks that we did NOT purchase.
-        Fetch their current price and compare to the scan price.  Treat
-        the simulated P&L as a learning signal so the weights evolve
-        faster — even between actual trades."""
-        scans = self.db.latest_candidates()
-        if not scans:
-            return 0
-        # Only evaluate buy candidates that are NOT in our current positions
-        held = {p.symbol for p in self.broker.positions()}
-        review = [
-            c for c in scans
-            if c.get("action") == "buy"
-            and c.get("symbol") not in held
-            and c.get("analyst_scores")
-        ]
-        if not review:
-            return 0
-        symbols = [c["symbol"] for c in review]
-        try:
-            prices = self.broker.latest_prices(symbols)
-        except Exception:  # noqa: BLE001
-            return 0
-        updated = 0
-        for candidate in review:
-            sym = candidate["symbol"]
-            scan_price = candidate.get("price", 0)
-            current = prices.get(sym, 0)
-            if not scan_price or not current:
+    def _record_shadow_candidates(self, candidates: List[Candidate], bought: List[dict]) -> List[dict]:
+        if not self.settings.shadow_mode_strategies:
+            return []
+        bought_symbols = {str(item.get("symbol", "")).upper() for item in bought}
+        held_symbols = {position.symbol for position in self.broker.positions()}
+        eligible: List[dict] = []
+        for candidate in candidates:
+            if candidate.symbol in bought_symbols or candidate.symbol in held_symbols:
                 continue
-            sim_pnl_pct = ((current - scan_price) / scan_price) * 100
-            # Dampen the signal — this is simulated, not a real trade
-            dampened_pnl = sim_pnl_pct * 0.4
-            analysis = candidate["analyst_scores"]
-            self.db.update_learning(analysis, dampened_pnl)
-            updated += 1
-            log.info(
-                "Retroactive learning for %s: scan=%.2f now=%.2f sim_pnl=%.2f%% (dampened=%.2f%%)",
-                sym, scan_price, current, sim_pnl_pct, dampened_pnl,
+            if candidate.final_score < self.settings.shadow_min_score:
+                continue
+            payload = candidate.model_dump()
+            payload["shadow_reason"] = (
+                "would-buy candidate not executed"
+                if candidate.action == "buy"
+                else "high-score watch candidate"
             )
-        return updated
+            eligible.append(payload)
+            if len(eligible) >= max(1, self.settings.shadow_max_picks_per_cycle):
+                break
+        inserted = self.db.record_shadow_picks("candidate_score", eligible)
+        if inserted:
+            self._record_audit_event(
+                "shadow",
+                "info",
+                f"Recorded {inserted} shadow candidate(s)",
+                {"strategy": "candidate_score", "count": inserted},
+            )
+        return eligible
+
+    def _new_performance_bucket(self, name: str) -> Dict[str, object]:
+        return {"name": name, "count": 0, "wins": 0, "losses": 0, "total_pnl_pct": 0.0, "avg_pnl_pct": 0.0}
+
+    def _add_performance_result(self, buckets: Dict[str, Dict[str, object]], name: str, pnl_pct: float) -> None:
+        bucket = buckets.setdefault(name, self._new_performance_bucket(name))
+        bucket["count"] = int(bucket["count"]) + 1
+        bucket["wins"] = int(bucket["wins"]) + (1 if pnl_pct > 0 else 0)
+        bucket["losses"] = int(bucket["losses"]) + (1 if pnl_pct <= 0 else 0)
+        bucket["total_pnl_pct"] = float(bucket["total_pnl_pct"]) + pnl_pct
+        bucket["avg_pnl_pct"] = float(bucket["total_pnl_pct"]) / int(bucket["count"])
+
+    def _performance_bucket_rows(self, buckets: Dict[str, Dict[str, object]]) -> List[Dict[str, object]]:
+        rows = list(buckets.values())
+        for row in rows:
+            row["total_pnl_pct"] = round(float(row["total_pnl_pct"]), 2)
+            row["avg_pnl_pct"] = round(float(row["avg_pnl_pct"]), 2)
+        rows.sort(key=lambda item: (int(item["count"]), float(item["avg_pnl_pct"])), reverse=True)
+        return rows
+
+    def _weekly_signal_performance(self) -> Dict[str, object]:
+        days = max(1, int(self.settings.weekly_report_days))
+        realized_buckets: Dict[str, Dict[str, object]] = {}
+        for trade in self.db.recent_realized_sells(days=days):
+            pnl_pct = float(trade.get("pnl_pct") or 0.0)
+            for strategy, score in (trade.get("analysis") or {}).items():
+                if float(score or 0.0) <= 0:
+                    continue
+                self._add_performance_result(realized_buckets, str(strategy), pnl_pct)
+
+        shadow_picks = self.db.recent_shadow_picks(days=days, limit=200)
+        symbols = sorted({str(item.get("symbol", "")).upper() for item in shadow_picks if item.get("symbol")})
+        try:
+            latest_prices = self.broker.latest_prices(symbols) if symbols else {}
+        except Exception:  # noqa: BLE001
+            latest_prices = {}
+
+        shadow_strategy_buckets: Dict[str, Dict[str, object]] = {}
+        shadow_signal_buckets: Dict[str, Dict[str, object]] = {}
+        enriched_shadow: List[Dict[str, object]] = []
+        for pick in shadow_picks:
+            symbol = str(pick.get("symbol", "")).upper()
+            entry_price = float(pick.get("price") or 0.0)
+            current_price = float(latest_prices.get(symbol) or 0.0)
+            if entry_price <= 0 or current_price <= 0:
+                pnl_pct = 0.0
+            else:
+                pnl_pct = ((current_price - entry_price) / entry_price) * 100
+            for strategy, score in (pick.get("analysis") or {}).items():
+                if float(score or 0.0) <= 0:
+                    continue
+                self._add_performance_result(shadow_strategy_buckets, str(strategy), pnl_pct)
+            for source, state in (pick.get("signal_usage") or {}).items():
+                self._add_performance_result(shadow_signal_buckets, f"{source}:{state}", pnl_pct)
+            enriched = dict(pick)
+            enriched["current_price"] = round(current_price, 2) if current_price > 0 else None
+            enriched["pnl_pct"] = round(pnl_pct, 2) if current_price > 0 else None
+            enriched_shadow.append(enriched)
+
+        return {
+            "days": days,
+            "realized_strategies": self._performance_bucket_rows(realized_buckets),
+            "shadow_strategies": self._performance_bucket_rows(shadow_strategy_buckets),
+            "shadow_signals": self._performance_bucket_rows(shadow_signal_buckets),
+            "shadow_picks": enriched_shadow[:20],
+        }
+
+    def _run_put_shadow(self) -> None:
+        """Feed bearish/risk-off signals into the paper put-shadow ledger.
+
+        This is completely OFF the live trading path: it only writes to a JSON
+        paper ledger and may send a one-time readiness email. Gated by
+        PUT_SHADOW_ENABLED (default off), and wrapped so it can NEVER break the
+        live trade cycle. See tradebot/put_shadow.py for the readiness logic.
+        """
+        if not self.settings.put_shadow_enabled:
+            return
+        try:
+            from .put_shadow import PutShadowLedger, realized_vol
+
+            ledger = PutShadowLedger(self.settings.data_dir / "put_shadow.json")
+            regime = self._market_regime_status()
+            self._update_regime_persistence(regime)
+            symbols = [str(s).upper() for s in (regime.get("symbols") or [])]
+            if not symbols:
+                return
+            short_w = max(2, int(self.settings.market_regime_short_window))
+            bars = self._fetch_bars(symbols, max(60, int(self.settings.market_regime_long_window) + 10))
+
+            prices: Dict[str, float] = {}
+            vols: Dict[str, float] = {}
+            closes_by_symbol: Dict[str, List[float]] = {}
+            for sym in symbols:
+                closes = [float(b["c"]) for b in (bars.get(sym) or []) if b.get("c") is not None]
+                if len(closes) < short_w:
+                    continue
+                closes_by_symbol[sym] = closes
+                prices[sym] = closes[-1]
+                vols[sym] = realized_vol(closes)
+
+            # Only OPEN a new synthetic put when the weak regime has persisted
+            # (same confirmation gate the bot uses for inverse-ETF hedges) AND
+            # the name is below its short MA — i.e. an actual momentum breakdown.
+            if (
+                regime.get("enabled")
+                and not regime.get("allow_long_buys")
+                and bool(regime.get("inverse_buys_confirmed"))
+            ):
+                for sym, closes in closes_by_symbol.items():
+                    short_ma = sum(closes[-short_w:]) / short_w
+                    if closes[-1] < short_ma:
+                        ledger.open_synthetic_put(sym, closes[-1], closes)
+
+            # Always mark/close existing open trades, then check the strict bar.
+            ledger.update_open_trades(prices, vols)
+            ledger.maybe_alert_ready()
+        except Exception as exc:  # noqa: BLE001 - paper feature must never break trading
+            log.warning("put-shadow hook skipped: %s", exc)
 
     def trade_once(self) -> Dict[str, List[dict]]:
         self._auto_scale_limits()
         self.broker.advance_market()
-        # Learn from previous scan picks before making new decisions
-        retro_count = self._retroactive_scan_learning()
-        if retro_count:
-            log.info("Retroactive learning applied to %d past scan picks", retro_count)
         sold = self.manage_positions()
         candidates = self.scan_market()
         bought = self.buy_candidates(candidates)
-        payload = {"sold": sold, "bought": bought, "candidates": [c.model_dump() for c in candidates]}
+        shadow = self._record_shadow_candidates(candidates, bought)
+        self._run_put_shadow()
+        payload = {"sold": sold, "bought": bought, "candidates": [c.model_dump() for c in candidates], "shadow": shadow}
         pause_reason = self._buying_pause_reason()
         if pause_reason:
             payload["buying_paused_reason"] = pause_reason
         return payload
 
     def trade_once_with_congress_refresh(self) -> Dict[str, List[dict]]:
-        self.refresh_all_signals()
-        return self.trade_once()
+        return self.trade_once_with_signal_refresh()
 
     def trade_once_with_signal_refresh(self) -> Dict[str, List[dict]]:
-        self.refresh_all_signals()
+        if self._should_refresh_signals_now():
+            self.refresh_all_signals()
         return self.trade_once()
+
+    def _should_refresh_signals_now(self) -> bool:
+        """Scheduled signal refreshes only run while the market is open.
+
+        The macro/congress/SEC feeds are external sites that rate-limit
+        around-the-clock scraping (HTTP 429), and their calendars don't
+        change while the market is closed. Demo mode always refreshes so
+        local runs and tests stay deterministic. Manual refreshes via the
+        CLI or dashboard endpoints bypass this gate entirely.
+        """
+        if self.settings.is_demo or not self._market_is_closed():
+            self._signals_paused_market_closed = False
+            return True
+        if not self._signals_paused_market_closed:
+            self._signals_paused_market_closed = True
+            self._record_audit_event(
+                "signal",
+                "info",
+                "signal refresh paused until the market reopens",
+                {"market_closed": True},
+            )
+        return False
 
     def dashboard_snapshot(self) -> dict:
         self._auto_scale_limits()
@@ -1542,6 +2315,8 @@ class TradingEngine:
         self._record_safety_transition(safety_status)
         signal_diagnostics = self._signal_diagnostics()
         performance = self._performance_summary(account, positions, trades)
+        market_regime = self._market_regime_status()
+        weekly_signal_performance = self._weekly_signal_performance()
         return {
             "account": account.model_dump(),
             "candidates": self.db.latest_candidates(),
@@ -1554,12 +2329,15 @@ class TradingEngine:
             "signal_health": self._signal_health(),
             "signal_diagnostics": signal_diagnostics,
             "signal_refresh_history": self.db.recent_signal_refresh_history(12),
+            "shadow_picks": weekly_signal_performance["shadow_picks"],
+            "weekly_signal_performance": weekly_signal_performance,
             "degraded_mode": self.degraded_mode(),
             "buying_paused_reason": self._buying_pause_reason(),
             "mode": self.settings.broker_mode,
             "provider": self.broker.name,
             "polygon_enabled": self.polygon is not None,
             "market_closed": self._market_is_closed(),
+            "is_trading_day": self._is_trading_day_today(),
             "market_session": {
                 "is_open": market_session["is_open"],
                 "current_session_date": market_session["current_session_date"],
@@ -1569,6 +2347,7 @@ class TradingEngine:
                 "next_close": market_session["next_close"].isoformat() if isinstance(market_session["next_close"], datetime) else None,
                 "is_early_close": market_session["is_early_close"],
             },
+            "market_regime": market_regime,
             "safety_status": safety_status,
             "inverse_etfs_enabled": self.settings.inverse_etfs_enabled,
             "inverse_etfs": self.settings.inverse_etfs,

@@ -1,14 +1,21 @@
 import os
+import subprocess
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import etrade_smoke
 
 from tradebot.congress import CongressTracker
 from tradebot.config import Settings
-from tradebot.dashboard import TradingScheduler, create_app
+from tradebot.dashboard import TradingScheduler, create_app, mirror_retry_needed
 from tradebot.db import Database
 from tradebot.engine import TradingEngine
+from tradebot.analyst_consensus import AnalystConsensusTracker
+from tradebot.email_report import _daily_and_total_summary, _extract_etrade_position_rows, build_report_html, get_etrade_report_summary
+from tradebot.etrade import ETradeError, extract_preview_id
+from tradebot.mirror import ETradeMirrorExecutor
 from tradebot.earnings import EarningsTracker
 from tradebot.macro import MacroTracker
 from tradebot.mcp_bridge import analyze as analyze_with_mcp
@@ -28,10 +35,20 @@ def make_settings(tmp_path: Path) -> Settings:
     settings.max_position_pct = 0.10
     settings.min_reward_risk = 1.8
     settings.starting_cash = 100_000
+    # Pin the price cap so results don't depend on a local .env value
+    # (0 means uncapped; the default $10 cap excludes test bars near $10).
+    settings.max_stock_price = 0.0
     settings.__post_init__()
     settings.congress_report_urls = []
+    # Keep tests offline: auto-discovery of official disclosures hits the network.
+    settings.congress_auto_fetch = False
     settings.sec_user_agent = ""
     settings.alpha_vantage_api_key = ""
+    settings.polygon_api_key = ""
+    settings.analyst_consensus_enabled = False
+    settings.market_regime_filter = False
+    settings.shadow_mode_strategies = False
+    settings.profit_lock_dollars = 0
     settings.congress_override_mode = "auto"
     return settings
 
@@ -63,6 +80,251 @@ def test_dashboard_renders(tmp_path: Path):
     response = client.get("/")
     assert response.status_code == 200
     assert "TradeBot Dashboard" in response.text
+
+
+def test_extract_etrade_position_rows_parses_gain_fields() -> None:
+    payload = {
+        "PortfolioResponse": {
+            "AccountPortfolio": [
+                {
+                    "Position": [
+                        {
+                            "Product": {"symbol": "VTI"},
+                            "quantity": 6.7359,
+                            "marketValue": 2342.6460,
+                            "todayGainLoss": -16.3684,
+                            "totalGain": 1580.3060,
+                        },
+                        {
+                            "Product": {"symbol": "MSFT"},
+                            "quantity": 5.3819,
+                            "marketValue": 2281.8495,
+                            "todayGainLoss": 31.7968,
+                            "totalGain": 2029.4495,
+                        },
+                    ]
+                }
+            ]
+        }
+    }
+
+    rows = _extract_etrade_position_rows(payload)
+
+    assert rows == [
+        {"symbol": "VTI", "quantity": 6.7359, "market_value": 2342.646, "day_gain": -16.3684, "total_gain": 1580.306},
+        {"symbol": "MSFT", "quantity": 5.3819, "market_value": 2281.8495, "day_gain": 31.7968, "total_gain": 2029.4495},
+    ]
+
+
+def test_get_etrade_report_summary_uses_balance_and_positions(monkeypatch) -> None:
+    class FakeClient:
+        def __init__(self, env_name: str) -> None:
+            assert env_name == "live"
+
+        def balance(self, account_id_key: str):
+            assert account_id_key == "ACCOUNTKEY"
+            return {
+                "BalanceResponse": {
+                    "Computed": {
+                        "totalAccountValue": 13308.41687,
+                        "cashAvailableForInvestment": 376.28,
+                    }
+                }
+            }
+
+        def positions(self, account_id_key: str):
+            assert account_id_key == "ACCOUNTKEY"
+            return {
+                "PortfolioResponse": {
+                    "AccountPortfolio": [
+                        {
+                            "Position": [
+                                {
+                                    "Product": {"symbol": "VTI"},
+                                    "quantity": 6.7359,
+                                    "marketValue": 2342.6460,
+                                    "todayGainLoss": -16.3684,
+                                    "totalGain": 1580.3060,
+                                },
+                                {
+                                    "Product": {"symbol": "MSFT"},
+                                    "quantity": 5.3819,
+                                    "marketValue": 2281.8495,
+                                    "todayGainLoss": 31.7968,
+                                    "totalGain": 2029.4495,
+                                },
+                            ]
+                        }
+                    ]
+                }
+            }
+
+    monkeypatch.setenv("ETRADE_ACCOUNT_ID_KEY", "ACCOUNTKEY")
+    monkeypatch.setenv("ETRADE_MIRROR_ENV", "live")
+    monkeypatch.setattr("tradebot.email_report.ETradeClient", FakeClient)
+
+    summary = get_etrade_report_summary()
+
+    assert summary is not None
+    assert summary["label"] == "E*TRADE"
+    assert summary["equity"] == 13308.42
+    assert summary["cash"] == 376.28
+    assert summary["daily_pnl"] == 15.43
+    assert summary["total_pnl"] == 3609.76
+
+
+def test_build_report_html_includes_etrade_comparison_block() -> None:
+    snapshot = {
+        "account": {"equity": 1100.0},
+        "performance": {"total_pnl": 100.0, "total_return_pct": 10.0},
+        "safety_status": {"daily_equity_anchor": 1050.0},
+    }
+    etrade_summary = {
+        "label": "E*TRADE",
+        "equity": 13308.42,
+        "cash": 376.28,
+        "daily_pnl": 15.43,
+        "daily_pct": 0.12,
+        "total_pnl": 3609.76,
+        "total_pct": 37.23,
+    }
+
+    html = build_report_html(snapshot, etrade_summary=etrade_summary)
+
+    assert "Account comparison" in html
+    assert "TradeBot / Alpaca" in html
+    assert "E*TRADE" in html
+    assert "$+15.43" in html
+
+
+def test_daily_report_prefers_broker_previous_close_equity() -> None:
+    snapshot = {
+        "account": {"equity": 1125.0, "last_equity": 1100.0},
+        "performance": {"total_pnl": 125.0, "total_return_pct": 12.5},
+        "safety_status": {"daily_equity_anchor": 1125.0},
+    }
+
+    summary = _daily_and_total_summary(snapshot)
+
+    assert summary["daily_anchor"] == 1100.0
+    assert summary["daily_anchor_source"] == "broker_previous_close"
+    assert summary["daily_pnl"] == 25.0
+    assert summary["daily_pct"] == 2.27
+
+
+def test_analyst_consensus_tracker_parses_stockanalysis_forecast_html(tmp_path: Path) -> None:
+    tracker = AnalystConsensusTracker(make_settings(tmp_path), Database(tmp_path / "tradebot.db"))
+    html = """
+    <html>
+      <body>
+        <p>Price Target: $24.47 (+0.53%)</p>
+        <p>Analyst Consensus: Hold</p>
+      </body>
+    </html>
+    """
+
+    parsed = tracker._parse(html)
+
+    assert parsed == {"consensus": "Hold", "target_upside_pct": 0.53}
+
+
+def test_analyst_consensus_tracker_parses_wrapped_stockanalysis_markup(tmp_path: Path) -> None:
+    tracker = AnalystConsensusTracker(make_settings(tmp_path), Database(tmp_path / "tradebot.db"))
+    html = """
+    <div>Price Target: <span>$24.47 (+0.33%)</span></div>
+    <div>Analyst Consensus: <span class="font-bold">Hold</span></div>
+    """
+
+    parsed = tracker._parse(html)
+
+    assert parsed == {"consensus": "Hold", "target_upside_pct": 0.33}
+
+
+def test_analyst_consensus_tracker_ignores_blank_cached_consensus(tmp_path: Path) -> None:
+    db = Database(tmp_path / "tradebot.db")
+    tracker = AnalystConsensusTracker(make_settings(tmp_path), db)
+    db.set_bot_state(
+        "analyst_consensus:CWAN",
+        json.dumps(
+            {
+                "symbol": "CWAN",
+                "source": "stockanalysis",
+                "consensus": "",
+                "target_upside_pct": 0.0,
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ),
+    )
+
+    assert tracker._load_cached("CWAN") is None
+
+
+def test_analyst_consensus_tracker_parses_yahoo_quote_recommendation(tmp_path: Path) -> None:
+    tracker = AnalystConsensusTracker(make_settings(tmp_path), Database(tmp_path / "tradebot.db"))
+    html = """
+    <script>
+      {"currentPrice":{"raw":23.31,"fmt":"23.31"},
+       "targetMeanPrice":{"raw":24.47,"fmt":"24.47"},
+       "recommendationMean":{"raw":3.0,"fmt":"3.00"},
+       "recommendationKey":"hold"}
+    </script>
+    """
+
+    parsed = tracker._parse_yahoo_quote(html)
+
+    assert parsed is not None
+    assert parsed["consensus"] == "Hold"
+    assert round(parsed["target_upside_pct"], 2) == 4.98
+
+
+def test_analyst_consensus_tracker_prefers_yahoo_quote_before_stockanalysis(tmp_path: Path) -> None:
+    tracker = AnalystConsensusTracker(make_settings(tmp_path), Database(tmp_path / "tradebot.db"))
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"currentPrice":{"raw":10.0},"targetMeanPrice":{"raw":12.0},"recommendationKey":"buy"}'
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        def get(self, url: str, timeout: int):
+            self.urls.append(url)
+            return FakeResponse()
+
+    fake_session = FakeSession()
+    tracker.session = fake_session
+
+    snapshot = tracker.get("CWAN")
+
+    assert snapshot is not None
+    assert snapshot["source"] == "yahoo_finance"
+    assert snapshot["source_url"] == "https://finance.yahoo.com/quote/CWAN"
+    assert snapshot["consensus"] == "Buy"
+    assert fake_session.urls == ["https://finance.yahoo.com/quote/CWAN"]
+
+
+def test_analyst_consensus_tracker_returns_none_when_fetches_fail(tmp_path: Path) -> None:
+    tracker = AnalystConsensusTracker(make_settings(tmp_path), Database(tmp_path / "tradebot.db"))
+
+    class FailingSession:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        def get(self, url: str, timeout: int):
+            self.urls.append(url)
+            raise TimeoutError("slow upstream")
+
+    fake_session = FailingSession()
+    tracker.session = fake_session
+
+    snapshot = tracker.get("CWAN")
+
+    assert snapshot is None
+    assert fake_session.urls == [
+        "https://finance.yahoo.com/quote/CWAN",
+        "https://stockanalysis.com/stocks/cwan/forecast/",
+    ]
 
 
 def test_healthcheck_endpoint(tmp_path: Path):
@@ -166,9 +428,25 @@ def test_trading_scheduler_runs_callback_once() -> None:
     calls = []
     scheduler = TradingScheduler(3600, lambda: calls.append("tick"))
 
-    scheduler.run_cycle()
+    result = scheduler.run_cycle()
 
+    assert result is True
     assert calls == ["tick"]
+
+
+def test_trading_scheduler_reports_callback_failure() -> None:
+    errors = []
+
+    def callback() -> None:
+        raise RuntimeError("boom")
+
+    scheduler = TradingScheduler(3600, callback, on_error=lambda exc: errors.append(exc))
+
+    result = scheduler.run_cycle()
+
+    assert result is False
+    assert len(errors) == 1
+    assert str(errors[0]) == "boom"
 
 
 def test_congress_tracker_parses_house_ptr_text(tmp_path: Path):
@@ -186,6 +464,202 @@ def test_congress_tracker_parses_house_ptr_text(tmp_path: Path):
     assert trades[0].member == "Hon. Example Member"
     assert trades[0].side == "buy"
     assert trades[1].side == "sell"
+
+
+def test_congress_tracker_parses_wrapped_ptr_rows(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    tracker = CongressTracker(settings, lambda symbols: {symbol: 5.0 for symbol in symbols})
+    # Mirrors real pypdf extraction: asset names wrap onto the lines before the
+    # [ST] marker and dollar ranges wrap onto the line after the dates.
+    text = """
+    Name: Hon. Example Member
+    F      S     : New
+    Adobe Inc. - Common Stock (ADBE)
+    [ST]
+    S (partial) 05/15/202606/05/2026$1,001 - $15,000
+    F      S     : New
+    SP Farmers & Merchants Bancorp, Inc.
+    (FMAO) [ST]
+    P 06/04/202606/04/2026$15,001 -
+    $50,000
+    F      S     : New
+    Coterra Energy Inc. Common Stock
+    (CTRA) [ST]
+    E 05/08/202606/05/2026$1,001 - $15,000
+    """
+
+    trades = tracker.parse_ptr_text(text, "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/example.pdf", "House")
+
+    assert [trade.symbol for trade in trades] == ["ADBE", "FMAO"]
+    assert trades[0].side == "sell"
+    assert trades[0].asset == "Adobe Inc. - Common Stock"
+    assert trades[1].side == "buy"
+    assert trades[1].amount_range == "$15,001 - $50,000"
+    assert trades[1].trade_date == "06/04/2026"
+
+
+def test_inverse_hedge_headroom_blocks_same_index_stacking(tmp_path: Path):
+    import math
+
+    settings = make_settings(tmp_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+
+    # SPXU and SH both short the S&P — holding one blocks the other outright.
+    assert engine._inverse_hedge_headroom("SPXU", [("SH", 200.0)], 1000.0) == 0.0
+    # A second distinct index is allowed up to the aggregate exposure cap.
+    assert engine._inverse_hedge_headroom("SDOW", [("SQQQ", 250.0)], 1000.0) == 50.0
+    # The distinct-position limit (default 2) blocks a third inverse fund.
+    assert engine._inverse_hedge_headroom("SH", [("SQQQ", 100.0), ("SDOW", 100.0)], 1000.0) == 0.0
+    # Regular stocks are never constrained by hedge limits.
+    assert math.isinf(engine._inverse_hedge_headroom("SOFI", [("SQQQ", 900.0)], 1000.0))
+    # Same-bucket stacking stays blocked even with the caps disabled.
+    settings.max_inverse_positions = 0
+    settings.max_inverse_exposure_pct = 0
+    assert engine._inverse_hedge_headroom("SPXS", [("SPXU", 50.0)], 1000.0) == 0.0
+    assert math.isinf(engine._inverse_hedge_headroom("SDOW", [("SPXU", 50.0)], 1000.0))
+
+
+def test_regime_persistence_gates_inverse_confirmation(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+    now = datetime.now(timezone.utc)
+
+    regime = {"enabled": False}
+    engine._update_regime_persistence(regime, now=now)
+    assert regime["inverse_buys_confirmed"] is True
+
+    # First weak reading starts the clock but does not confirm hedges.
+    regime = {"enabled": True, "allow_long_buys": False, "state": "weak"}
+    engine._update_regime_persistence(regime, now=now)
+    assert regime["inverse_buys_confirmed"] is False
+
+    # Weakness persisting past the window confirms hedge entries.
+    regime = {"enabled": True, "allow_long_buys": False, "state": "weak"}
+    engine._update_regime_persistence(regime, now=now + timedelta(hours=19))
+    assert regime["inverse_buys_confirmed"] is True
+
+    # Missing data never confirms hedges.
+    regime = {"enabled": True, "allow_long_buys": False, "state": "missing"}
+    engine._update_regime_persistence(regime, now=now + timedelta(hours=20))
+    assert regime["inverse_buys_confirmed"] is False
+
+    # An uptrend reading resets the clock for the next weak stretch.
+    regime = {"enabled": True, "allow_long_buys": True, "state": "uptrend"}
+    engine._update_regime_persistence(regime, now=now + timedelta(hours=21))
+    assert regime["inverse_buys_confirmed"] is False
+    regime = {"enabled": True, "allow_long_buys": False, "state": "weak"}
+    engine._update_regime_persistence(regime, now=now + timedelta(hours=22))
+    assert regime["inverse_buys_confirmed"] is False
+
+
+def test_earnings_blackout_blocks_imminent_reports(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+
+    assert engine._in_earnings_blackout({"has_upcoming_earnings": 1.0, "days_until_earnings": 1.0}) is True
+    assert engine._in_earnings_blackout({"has_upcoming_earnings": 1.0, "days_until_earnings": 5.0}) is False
+    assert engine._in_earnings_blackout({"has_upcoming_earnings": 0.0, "days_until_earnings": 22.0}) is False
+    settings.earnings_blackout_days = 0
+    assert engine._in_earnings_blackout({"has_upcoming_earnings": 1.0, "days_until_earnings": 0.0}) is False
+
+
+def test_congress_refresh_keeps_all_trades_when_price_cap_disabled(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.congress_max_price = 0
+    settings.congress_report_urls = ["https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/example.pdf"]
+
+    def fake_prices(symbols: list[str]) -> dict[str, float]:
+        return {"AAA": 50.0}  # BBB has no quote at all
+
+    tracker = CongressTracker(settings, fake_prices)
+
+    def fake_fetch(url: str, fallback_member: str | None = None) -> list[CongressTrade]:
+        return [
+            CongressTrade(
+                member="Hon. Example Member",
+                chamber="House",
+                symbol=symbol,
+                asset=f"{symbol} Common Stock",
+                side="buy",
+                trade_date="06/01/2026",
+                filed_date="06/05/2026",
+                amount_range="$1,001 - $15,000",
+                source_url=url,
+            )
+            for symbol in ("AAA", "BBB")
+        ]
+
+    tracker._fetch_report = fake_fetch  # type: ignore[method-assign]
+
+    trades = tracker.refresh()
+
+    assert [trade.symbol for trade in trades] == ["AAA", "BBB"]
+    assert all(trade.under_price_cap for trade in trades)
+    assert trades[0].current_price == 50.0
+    assert trades[1].current_price is None
+
+
+def test_parse_house_index_filters_to_recent_ptrs():
+    from datetime import date
+
+    from tradebot.congress import parse_house_index
+
+    index_text = (
+        "Prefix\tLast\tFirst\tSuffix\tFilingType\tStateDst\tYear\tFilingDate\tDocID\n"
+        "Hon.\tSuozzi\tThomas\t\tP\tNY03\t2026\t6/9/2026\t20034747\n"
+        "Hon.\tOld\tMember\t\tP\tNY01\t2026\t1/2/2026\t20030001\n"
+        "Hon.\tBiggs\tSheri\t\tP\tSC03\t2026\t6/9/2026\t20034496\n"
+        "\tAaron\tRichard\t\tW\tMI04\t2026\t4/15/2026\t8068\n"
+    )
+
+    entries = parse_house_index(index_text, cutoff=date(2026, 5, 1))
+
+    assert [entry[1] for entry in entries] == ["20034747", "20034496"]
+    assert entries[0][0] == "Hon. Thomas Suozzi"
+    assert entries[0][2] == date(2026, 6, 9)
+
+
+def test_congress_tracker_parses_senate_ptr_html(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    tracker = CongressTracker(settings, lambda symbols: {symbol: 5.0 for symbol in symbols})
+    html = """
+    <table class="table">
+      <thead>
+        <tr><th>#</th><th>Transaction Date</th><th>Owner</th><th>Ticker</th><th>Asset Name</th>
+        <th>Asset Type</th><th>Type</th><th>Amount</th><th>Comment</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>1</td><td>06/05/2026</td><td>Self</td><td><a href="#">PTON</a></td>
+        <td>Peloton Interactive, Inc. - Common Stock</td><td>Stock</td><td>Sale (Full)</td>
+        <td>$1,001 - $15,000</td><td>--</td></tr>
+        <tr><td>2</td><td>06/04/2026</td><td>Spouse</td><td>--</td>
+        <td>City Muni Bond</td><td>Municipal Security</td><td>Purchase</td>
+        <td>$1,001 - $15,000</td><td>--</td></tr>
+        <tr><td>3</td><td>06/03/2026</td><td>Self</td><td><a href="#">AAPL</a></td>
+        <td>Apple Calls</td><td>Stock Option</td><td>Purchase</td>
+        <td>$1,001 - $15,000</td><td>--</td></tr>
+        <tr><td>4</td><td>06/02/2026</td><td>Self</td><td><a href="#">QQQ</a></td>
+        <td>Invesco QQQ Trust</td><td>Stock</td><td>Exchange</td>
+        <td>$1,001 - $15,000</td><td>--</td></tr>
+        <tr><td>5</td><td>06/01/2026</td><td>Self</td><td><a href="#">SOUN</a></td>
+        <td>SoundHound AI, Inc.</td><td>Stock</td><td>Purchase</td>
+        <td>$1,001 - $15,000</td><td>--</td></tr>
+      </tbody>
+    </table>
+    """
+
+    trades = tracker.parse_senate_ptr_html(
+        html,
+        "https://efdsearch.senate.gov/search/view/ptr/example/",
+        "James Banks",
+        "06/07/2026",
+    )
+
+    assert [(trade.symbol, trade.side) for trade in trades] == [("PTON", "sell"), ("SOUN", "buy")]
+    assert trades[0].chamber == "Senate"
+    assert trades[0].member == "James Banks"
+    assert trades[0].filed_date == "06/07/2026"
+    assert trades[0].trade_date == "06/05/2026"
 
 
 def test_refresh_congress_trades_filters_to_under_price_cap(tmp_path: Path):
@@ -315,6 +789,33 @@ def test_trade_once_with_congress_refresh_runs_refresh_first(tmp_path: Path):
     assert result == {"sold": [], "bought": [], "candidates": []}
 
 
+def test_trade_once_with_signal_refresh_skips_refresh_when_market_closed(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+    settings.broker_mode = "paper"  # non-demo so the market-hours gate applies
+    calls: list[str] = []
+
+    engine.refresh_all_signals = lambda: calls.append("refresh") or {}  # type: ignore[method-assign]
+    engine.trade_once = lambda: calls.append("trade") or {"sold": [], "bought": [], "candidates": []}  # type: ignore[method-assign]
+    engine._market_is_closed = lambda: True  # type: ignore[method-assign]
+
+    engine.trade_once_with_signal_refresh()
+    engine.trade_once_with_signal_refresh()
+
+    assert calls == ["trade", "trade"]
+    pause_events = [
+        event
+        for event in engine.db.recent_audit_events(20)
+        if "signal refresh paused" in str(event.get("message", ""))
+    ]
+    assert len(pause_events) == 1
+
+    engine._market_is_closed = lambda: False  # type: ignore[method-assign]
+    engine.trade_once_with_signal_refresh()
+
+    assert calls == ["trade", "trade", "refresh", "trade"]
+
+
 def test_dashboard_trade_once_refreshes_signals_before_trading(tmp_path: Path):
     settings = make_settings(tmp_path)
     app = create_app(settings)
@@ -331,6 +832,44 @@ def test_dashboard_trade_once_refreshes_signals_before_trading(tmp_path: Path):
 
     assert response.status_code == 303
     assert calls == ["trade"]
+
+
+def test_dashboard_mirror_retry_picks_up_pending_trade_after_reauth(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    db = Database(settings.db_path)
+
+    class FakeMirror:
+        def __init__(self) -> None:
+            self._status = {
+                "enabled": True,
+                "ready": False,
+                "env": "live",
+                "preview_only": False,
+                "account_id_key": "ABC123456",
+                "last_trade_id": 101,
+                "last_result": "retry pending UAMY",
+                "last_error": "500 service unavailable",
+                "auth_expired": False,
+                "recovery_hint": "",
+            }
+
+        def enabled(self) -> bool:
+            return True
+
+        def status(self):
+            return dict(self._status)
+
+    fake_mirror = FakeMirror()
+    db.record_trade("UAMY", "sell", 2, 9.91, "filled", "stop hit")
+
+    assert mirror_retry_needed(db, fake_mirror) is True
+
+    fake_mirror._status["last_trade_id"] = 102
+    fake_mirror._status["last_result"] = "placed UAMY SELL x2"
+    fake_mirror._status["last_error"] = ""
+    fake_mirror._status["ready"] = True
+
+    assert mirror_retry_needed(db, fake_mirror) is False
 
 
 def test_refresh_all_signals_runs_each_source(tmp_path: Path):
@@ -601,7 +1140,6 @@ def test_decision_support_penalizes_near_term_macro_event() -> None:
             "min_reward_risk": 1.8,
             "has_near_macro_event": 1.0,
             "days_until_macro_event": 6.0,
-            "near_cpi_count": 0.0,
             "near_fomc_count": 0.0,
         }
     )
@@ -624,7 +1162,6 @@ def test_decision_support_penalizes_near_term_macro_event() -> None:
             "min_reward_risk": 1.8,
             "has_near_macro_event": 1.0,
             "days_until_macro_event": 1.0,
-            "near_cpi_count": 0.0,
             "near_fomc_count": 1.0,
         }
     )
@@ -681,13 +1218,12 @@ AAPL,Apple,{_iso_date(40)},2025-12-31,1.23,USD,post-market
     assert events[0].symbol == "HOOD"
 
 
-def test_macro_tracker_parses_cpi_and_fomc_dates(tmp_path: Path) -> None:
+def test_macro_tracker_parses_fomc_dates(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     tracker = MacroTracker(settings)
-    cpi_html = "<html><body>Consumer Price Index April 10, 2026 Consumer Price Index May 12, 2026</body></html>"
     fomc_html = (
         '<html><body>\n'
-        '<div>2026 FOMC Meetings</div>\n'
+        '<div>2030 FOMC Meetings</div>\n'
         '<div class="fomc-meeting__month">June</div>\n'
         '<div class="fomc-meeting__date">15-16</div>\n'
         '<div class="fomc-meeting__month">July</div>\n'
@@ -696,25 +1232,13 @@ def test_macro_tracker_parses_cpi_and_fomc_dates(tmp_path: Path) -> None:
     )
 
     # Patch _get_text so we can inject HTML without hitting the network.
-    original_get_text = tracker._get_text
-    call_count = {"cpi": 0, "fomc": 0}
+    tracker._get_text = lambda url: fomc_html  # type: ignore[method-assign]
 
-    def fake_get_text(url: str) -> str:
-        if "inflation" in url:
-            call_count["cpi"] += 1
-            return cpi_html
-        call_count["fomc"] += 1
-        return fomc_html
+    events = tracker.refresh()
 
-    tracker._get_text = fake_get_text  # type: ignore[method-assign]
-    try:
-        cpi_events = tracker._fetch_cpi()
-        fomc_events = tracker._fetch_fomc()
-    finally:
-        tracker._get_text = original_get_text  # type: ignore[method-assign]
-
-    assert any(event.event_type == "cpi" for event in cpi_events)
-    assert any(event.event_type == "fomc" for event in fomc_events)
+    assert len(events) == 2
+    assert all(event.event_type == "fomc" for event in events)
+    assert events[0].event_date == "2030-06-16"
 
 
 def test_refresh_sec_filings_stores_symbol_signal_inputs(tmp_path: Path) -> None:
@@ -1259,6 +1783,50 @@ def test_dashboard_snapshot_includes_position_stop_details(tmp_path: Path):
     assert "unrealized_pnl" in snapshot["performance"]
 
 
+def test_performance_return_uses_tracked_pnl_not_restart_baseline(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.broker_mode = "live"
+    settings.__post_init__()
+    db = Database(settings.db_path)
+
+    class RestartedLiveBroker(BaseBroker):
+        def account(self) -> AccountSnapshot:
+            return AccountSnapshot(cash=900.0, equity=1200.0, buying_power=900.0, mode="live", last_equity=1175.0)
+
+        def positions(self) -> list[PositionSnapshot]:
+            return [
+                PositionSnapshot(
+                    symbol="AAPL",
+                    qty=2,
+                    avg_entry_price=100.0,
+                    current_price=115.0,
+                    market_value=230.0,
+                    unrealized_pl_pct=15.0,
+                )
+            ]
+
+        def bars(self, symbols: list[str], days: int) -> dict[str, list[dict]]:
+            return {}
+
+        def latest_prices(self, symbols: list[str]) -> dict[str, float]:
+            return {"AAPL": 115.0}
+
+        def buy(self, symbol: str, qty: int, stop_price=None, target_price=None) -> dict:
+            raise NotImplementedError
+
+        def sell(self, symbol: str, qty=None) -> dict:
+            raise NotImplementedError
+
+    db.record_trade("MSFT", "sell", 1, 120.0, "filled", "target hit", pnl_amount=20.0)
+    engine = TradingEngine(settings=settings, broker=RestartedLiveBroker(settings), db=db)
+
+    performance = engine.dashboard_snapshot()["performance"]
+
+    assert performance["total_pnl"] == 50.0
+    assert performance["tracked_basis"] == 1150.0
+    assert performance["total_return_pct"] == 4.35
+
+
 def test_buy_kill_switch_pauses_new_buys_but_not_scans(tmp_path: Path):
     settings = make_settings(tmp_path)
     settings.buy_kill_switch = True
@@ -1436,6 +2004,362 @@ def test_sell_records_include_realized_pnl_amount(tmp_path: Path):
     assert trades[0]["pnl_amount"] == -20.0
 
 
+def test_etrade_mirror_previews_new_trade_and_skips_reconciled_entries(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.etrade_mirror_enabled = True
+    settings.etrade_account_id_key = "ABC123456"
+    settings.etrade_mirror_env = "sandbox"
+    settings.etrade_mirror_preview_only = True
+    settings.etrade_mirror_max_order_value = 500
+    settings.etrade_mirror_max_total_capital = 1_000
+    db = Database(settings.db_path)
+
+    class FakeETradeClient:
+        def __init__(self) -> None:
+            self.preview_calls = []
+
+        def estimated_position_market_value(self, account_id_key: str) -> float:
+            return 100.0
+
+        def preview_equity_order(self, account_id_key: str, symbol: str, side: str, qty: int):
+            self.preview_calls.append((account_id_key, symbol, side, qty))
+            return {"PreviewIds": [{"previewId": "abc"}]}
+
+        def place_equity_order(self, account_id_key: str, symbol: str, side: str, qty: int, preview_payload=None):
+            raise AssertionError("place should not be called in preview-only mode")
+
+    client = FakeETradeClient()
+    mirror = ETradeMirrorExecutor(settings=settings, db=db, client=client)
+
+    db.record_trade("OLD", "buy", 1, 10.0, "filled", "entry")
+    seeded = mirror.sync_new_trades()
+    seeded_status = mirror.status()
+
+    assert seeded == []
+    assert seeded_status["last_trade_id"] == 1
+    assert "seeded cursor" in seeded_status["last_result"]
+
+    db.record_trade("AAPL", "buy", 2, 100.0, "filled", "entry")
+    db.record_trade("MSFT", "buy", 1, 50.0, "reconciled", "reconciled external position")
+
+    results = mirror.sync_new_trades()
+    status = mirror.status()
+
+    assert len(results) == 1
+    assert results[0]["status"] == "preview"
+    assert client.preview_calls == [("ABC123456", "AAPL", "BUY", 2)]
+    assert status["last_trade_id"] == 3
+    assert "skipped" in status["last_result"] or "preview" in status["last_result"]
+
+
+def test_etrade_mirror_places_order_when_preview_only_disabled(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.etrade_mirror_enabled = True
+    settings.etrade_account_id_key = "ABC123456"
+    settings.etrade_mirror_env = "live"
+    settings.etrade_mirror_preview_only = False
+    settings.etrade_mirror_max_order_value = 1_000
+    settings.etrade_mirror_max_total_capital = 2_000
+    db = Database(settings.db_path)
+
+    class FakeETradeClient:
+        def __init__(self) -> None:
+            self.preview_calls = []
+            self.place_calls = []
+
+        def estimated_position_market_value(self, account_id_key: str) -> float:
+            return 0.0
+
+        def symbol_quantity(self, account_id_key: str, symbol: str) -> int:
+            return 10
+
+        def preview_equity_order(self, account_id_key: str, symbol: str, side: str, qty: int):
+            self.preview_calls.append((account_id_key, symbol, side, qty))
+            return {"PreviewIds": [{"previewId": "abc"}]}
+
+        def place_equity_order(self, account_id_key: str, symbol: str, side: str, qty: int, preview_payload=None):
+            self.place_calls.append((account_id_key, symbol, side, qty, extract_preview_id(preview_payload or {})))
+            return {"PlaceOrderResponse": {"orderId": "123"}}
+
+    client = FakeETradeClient()
+    mirror = ETradeMirrorExecutor(settings=settings, db=db, client=client)
+
+    db.record_trade("OLD", "buy", 1, 10.0, "filled", "entry")
+    mirror.sync_new_trades()
+    db.record_trade("AAPL", "buy", 2, 95.0, "filled", "entry")
+    mirror.sync_new_trades()
+    db.record_trade("AAPL", "sell", 2, 100.0, "filled", "trailing stop")
+
+    results = mirror.sync_new_trades()
+
+    assert len(results) == 1
+    assert results[0]["status"] == "placed"
+    assert client.preview_calls[-1] == ("ABC123456", "AAPL", "SELL", 10)
+    assert client.place_calls[-1] == ("ABC123456", "AAPL", "SELL", 10, "abc")
+
+
+def test_etrade_mirror_keeps_partial_sell_quantity_when_tradebot_still_holds_symbol(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.etrade_mirror_enabled = True
+    settings.etrade_account_id_key = "ABC123456"
+    settings.etrade_mirror_env = "live"
+    settings.etrade_mirror_preview_only = False
+    settings.etrade_mirror_max_order_value = 1_000
+    settings.etrade_mirror_max_total_capital = 2_000
+    db = Database(settings.db_path)
+
+    class FakeETradeClient:
+        def __init__(self) -> None:
+            self.preview_calls = []
+            self.place_calls = []
+
+        def estimated_position_market_value(self, account_id_key: str) -> float:
+            return 0.0
+
+        def symbol_quantity(self, account_id_key: str, symbol: str) -> int:
+            return 10
+
+        def preview_equity_order(self, account_id_key: str, symbol: str, side: str, qty: int):
+            self.preview_calls.append((account_id_key, symbol, side, qty))
+            return {"PreviewIds": [{"previewId": "abc"}]}
+
+        def place_equity_order(self, account_id_key: str, symbol: str, side: str, qty: int, preview_payload=None):
+            self.place_calls.append((account_id_key, symbol, side, qty, extract_preview_id(preview_payload or {})))
+            return {"PlaceOrderResponse": {"orderId": "123"}}
+
+    client = FakeETradeClient()
+    mirror = ETradeMirrorExecutor(settings=settings, db=db, client=client)
+
+    db.record_trade("OLD", "buy", 1, 10.0, "filled", "entry")
+    mirror.sync_new_trades()
+    db.record_trade("PLUG", "buy", 5, 4.0, "filled", "entry")
+    db.record_trade("PLUG", "sell", 2, 4.5, "filled", "trim")
+
+    results = mirror.sync_new_trades()
+
+    assert len(results) == 2
+    assert results[-1]["status"] == "placed"
+    assert client.preview_calls[-1] == ("ABC123456", "PLUG", "SELL", 2)
+    assert client.place_calls[-1] == ("ABC123456", "PLUG", "SELL", 2, "abc")
+
+
+def test_etrade_mirror_init_failure_does_not_raise(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.etrade_mirror_enabled = True
+    settings.etrade_account_id_key = "ABC123456"
+    db = Database(settings.db_path)
+
+    mirror = ETradeMirrorExecutor(settings=settings, db=db)
+    mirror._client = lambda: (_ for _ in ()).throw(RuntimeError("missing tokens"))  # type: ignore[attr-defined]
+
+    results = mirror.sync_new_trades()
+    status = mirror.status()
+
+    assert results == []
+    assert "missing tokens" in status["last_error"]
+
+
+def test_etrade_mirror_auth_failure_does_not_advance_trade_cursor(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.etrade_mirror_enabled = True
+    settings.etrade_account_id_key = "ABC123456"
+    settings.etrade_mirror_env = "live"
+    settings.etrade_mirror_preview_only = False
+    db = Database(settings.db_path)
+
+    class FakeETradeClient:
+        def estimated_position_market_value(self, account_id_key: str) -> float:
+            return 0.0
+
+        def symbol_quantity(self, account_id_key: str, symbol: str) -> int:
+            return 3
+
+        def preview_equity_order(self, account_id_key: str, symbol: str, side: str, qty: int):
+            raise ETradeError('401 Unauthorized: {"Error":{"message":"oauth_problem=token_expired"}}')
+
+    client = FakeETradeClient()
+    mirror = ETradeMirrorExecutor(settings=settings, db=db, client=client)
+
+    db.record_trade("OLD", "buy", 1, 10.0, "filled", "entry")
+    mirror.sync_new_trades()
+    db.record_trade("PLUG", "sell", 1, 2.99, "filled", "stop hit")
+
+    results = mirror.sync_new_trades()
+    status = mirror.status()
+
+    assert results == [
+        {
+            "trade_id": 2,
+            "symbol": "PLUG",
+            "side": "SELL",
+            "status": "reauth-required",
+            "error": '401 Unauthorized: {"Error":{"message":"oauth_problem=token_expired"}}',
+        }
+    ]
+    assert status["last_trade_id"] == 1
+    assert status["auth_expired"] is True
+    assert status["last_result"] == "reauth required"
+    assert "sync the fresh live token to Railway" in status["recovery_hint"]
+
+
+def test_etrade_mirror_auth_failure_during_symbol_lookup_keeps_trade_replayable(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.etrade_mirror_enabled = True
+    settings.etrade_account_id_key = "ABC123456"
+    settings.etrade_mirror_env = "live"
+    settings.etrade_mirror_preview_only = False
+    db = Database(settings.db_path)
+
+    class FakeETradeClient:
+        def estimated_position_market_value(self, account_id_key: str) -> float:
+            return 0.0
+
+        def symbol_quantity(self, account_id_key: str, symbol: str) -> int:
+            raise ETradeError('401 Unauthorized: {"Error":{"message":"oauth_problem=token_expired"}}')
+
+        def preview_equity_order(self, account_id_key: str, symbol: str, side: str, qty: int):
+            raise AssertionError("preview should not run when symbol lookup fails")
+
+    client = FakeETradeClient()
+    mirror = ETradeMirrorExecutor(settings=settings, db=db, client=client)
+
+    db.record_trade("OLD", "buy", 1, 10.0, "filled", "entry")
+    mirror.sync_new_trades()
+    db.record_trade("PLUG", "sell", 1, 2.99, "filled", "stop hit")
+
+    results = mirror.sync_new_trades()
+    status = mirror.status()
+
+    assert results == [
+        {
+            "trade_id": 2,
+            "symbol": "PLUG",
+            "side": "SELL",
+            "status": "reauth-required",
+            "error": '401 Unauthorized: {"Error":{"message":"oauth_problem=token_expired"}}',
+        }
+    ]
+    assert status["last_trade_id"] == 1
+    assert status["auth_expired"] is True
+
+
+def test_etrade_mirror_transient_failure_keeps_trade_replayable(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.etrade_mirror_enabled = True
+    settings.etrade_account_id_key = "ABC123456"
+    settings.etrade_mirror_env = "live"
+    settings.etrade_mirror_preview_only = False
+    db = Database(settings.db_path)
+
+    class FakeETradeClient:
+        def estimated_position_market_value(self, account_id_key: str) -> float:
+            return 0.0
+
+        def preview_equity_order(self, account_id_key: str, symbol: str, side: str, qty: int):
+            raise ETradeError('500 Internal Server Error: {"Error":{"code":100,"message":"The requested service is not currently available, please try after sometime."}}')
+
+    client = FakeETradeClient()
+    mirror = ETradeMirrorExecutor(settings=settings, db=db, client=client)
+
+    db.record_trade("OLD", "buy", 1, 10.0, "filled", "entry")
+    mirror.sync_new_trades()
+    db.record_trade("UAMY", "buy", 2, 9.74, "pending_new", "entry")
+
+    results = mirror.sync_new_trades()
+    status = mirror.status()
+
+    assert results == [
+        {
+            "trade_id": 2,
+            "symbol": "UAMY",
+            "side": "BUY",
+            "status": "retry-pending",
+            "error": '500 Internal Server Error: {"Error":{"code":100,"message":"The requested service is not currently available, please try after sometime."}}',
+        }
+    ]
+    assert status["last_trade_id"] == 1
+    assert status["last_result"] == "retry pending UAMY"
+    assert "service is not currently available" in status["last_error"]
+
+
+def test_etrade_mirror_init_auth_failure_marks_reauth_required(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.etrade_mirror_enabled = True
+    settings.etrade_account_id_key = "ABC123456"
+    db = Database(settings.db_path)
+
+    mirror = ETradeMirrorExecutor(settings=settings, db=db)
+    mirror._client = lambda: (_ for _ in ()).throw(RuntimeError('401 Unauthorized: {"Error":{"message":"oauth_problem=token_expired"}}'))  # type: ignore[attr-defined]
+
+    results = mirror.sync_new_trades()
+    status = mirror.status()
+
+    assert results == []
+    assert status["last_trade_id"] == 0
+    assert status["auth_expired"] is True
+    assert status["last_result"] == "reauth required"
+
+
+def test_etrade_client_loads_tokens_from_env_before_file(tmp_path: Path):
+    previous_access = os.environ.get("ETRADE_LIVE_ACCESS_TOKEN")
+    previous_secret = os.environ.get("ETRADE_LIVE_ACCESS_TOKEN_SECRET")
+    os.environ["ETRADE_LIVE_ACCESS_TOKEN"] = "env-access"
+    os.environ["ETRADE_LIVE_ACCESS_TOKEN_SECRET"] = "env-secret"
+    try:
+        from tradebot.etrade import load_etrade_tokens
+
+        tokens = load_etrade_tokens("live")
+    finally:
+        if previous_access is None:
+            os.environ.pop("ETRADE_LIVE_ACCESS_TOKEN", None)
+        else:
+            os.environ["ETRADE_LIVE_ACCESS_TOKEN"] = previous_access
+        if previous_secret is None:
+            os.environ.pop("ETRADE_LIVE_ACCESS_TOKEN_SECRET", None)
+        else:
+            os.environ["ETRADE_LIVE_ACCESS_TOKEN_SECRET"] = previous_secret
+
+    assert tokens["access_token"] == "env-access"
+    assert tokens["access_token_secret"] == "env-secret"
+
+
+def test_etrade_smoke_syncs_saved_tokens_to_railway(tmp_path: Path, monkeypatch):
+    token_dir = tmp_path / ".etrade"
+    token_dir.mkdir(parents=True, exist_ok=True)
+    (token_dir / "live.tokens.json").write_text(
+        '{"access_token": "token-123", "access_token_secret": "secret-456"}'
+    )
+    monkeypatch.setenv("ETRADE_TOKEN_DIR", str(token_dir))
+    captured = {}
+
+    def fake_run(command, check, capture_output, text):
+        captured["command"] = command
+        captured["check"] = check
+        captured["capture_output"] = capture_output
+        captured["text"] = text
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(etrade_smoke.subprocess, "run", fake_run)
+    monkeypatch.setattr(etrade_smoke, "_railway_cli", lambda: "railway")
+
+    etrade_smoke._sync_tokens_to_railway("live", service="tradebot", environment="production")
+
+    assert captured["command"] == [
+        "railway",
+        "variable",
+        "set",
+        "ETRADE_LIVE_ACCESS_TOKEN=token-123",
+        "ETRADE_LIVE_ACCESS_TOKEN_SECRET=secret-456",
+        "--service",
+        "tradebot",
+        "--environment",
+        "production",
+    ]
+    assert captured["check"] is True
+    assert captured["capture_output"] is True
+    assert captured["text"] is True
+
+
 def test_settings_reads_stop_loss_from_env(tmp_path: Path):
     previous_stop_loss = os.environ.get("STOP_LOSS")
     previous_stop_loss_pct = os.environ.get("STOP_LOSS_PCT")
@@ -1482,9 +2406,78 @@ def test_alpaca_buy_uses_bracket_order_payload(tmp_path: Path):
     assert url.endswith("/v2/orders")
     assert payload["symbol"] == "AAPL"
     assert payload["qty"] == 3
+    assert payload["time_in_force"] == "gtc"
     assert payload["order_class"] == "bracket"
     assert payload["stop_loss"] == {"stop_price": 9.5}
     assert payload["take_profit"] == {"limit_price": 11.25}
+
+
+def test_alpaca_fractional_buy_skips_bracket_order_payload(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.alpaca_key_id = "key"
+    settings.alpaca_secret_key = "secret"
+    settings.use_broker_protective_orders = True
+    settings.__post_init__()
+
+    broker = CaptureAlpacaBroker(settings)
+    broker.buy("AAPL", 0.75, stop_price=9.5, target_price=11.25)
+
+    method, url, kwargs = broker.calls[-1]
+    payload = kwargs["json"]
+    assert method == "POST"
+    assert url.endswith("/v2/orders")
+    assert payload["symbol"] == "AAPL"
+    assert payload["qty"] == 0.75
+    assert payload["time_in_force"] == "day"
+    assert "order_class" not in payload
+
+
+def test_alpaca_whole_share_protective_exit_uses_oco_gtc_payload(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.alpaca_key_id = "key"
+    settings.alpaca_secret_key = "secret"
+    settings.__post_init__()
+
+    broker = CaptureAlpacaBroker(settings)
+    broker.submit_protective_exit("AAPL", 3, stop_price=9.5, target_price=11.25)
+
+    method, url, kwargs = broker.calls[-1]
+    payload = kwargs["json"]
+    assert method == "POST"
+    assert url.endswith("/v2/orders")
+    assert payload["symbol"] == "AAPL"
+    assert payload["qty"] == 3
+    assert payload["side"] == "sell"
+    assert payload["type"] == "limit"
+    assert payload["time_in_force"] == "gtc"
+    assert payload["order_class"] == "oco"
+    assert payload["stop_loss"] == {"stop_price": 9.5}
+    assert payload["take_profit"] == {"limit_price": 11.25}
+
+
+def test_alpaca_fractional_protective_exit_uses_day_stop_payload(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.alpaca_key_id = "key"
+    settings.alpaca_secret_key = "secret"
+    settings.__post_init__()
+
+    broker = CaptureAlpacaBroker(settings)
+    broker.submit_protective_exit("AAPL", 0.75, stop_price=9.5, target_price=11.25)
+
+    method, url, kwargs = broker.calls[-1]
+    payload = kwargs["json"]
+    assert method == "POST"
+    assert url.endswith("/v2/orders")
+    assert payload["symbol"] == "AAPL"
+    assert payload["qty"] == 0.75
+    assert payload["side"] == "sell"
+    assert payload["type"] == "stop"
+    assert payload["time_in_force"] == "day"
+    assert payload["stop_price"] == 9.5
+    assert "order_class" not in payload
 
 
 class UniverseAlpacaBroker(AlpacaBroker):
@@ -1503,6 +2496,7 @@ def test_alpaca_broker_builds_dynamic_universe_when_scan_universe_is_blank(tmp_p
     settings.broker_mode = "paper"
     settings.alpaca_key_id = "key"
     settings.alpaca_secret_key = "secret"
+    settings.live_universe_mode = "dynamic"
     settings.__post_init__()
     broker = UniverseAlpacaBroker(
         settings,
@@ -1518,6 +2512,21 @@ def test_alpaca_broker_builds_dynamic_universe_when_scan_universe_is_blank(tmp_p
     universe = broker.universe()
 
     assert sorted(universe) == ["AAPL", "MSFT", "SPY"]
+
+
+def test_alpaca_broker_uses_liquid_universe_by_default(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.alpaca_key_id = "key"
+    settings.alpaca_secret_key = "secret"
+    settings.__post_init__()
+    broker = UniverseAlpacaBroker(settings, [{"symbol": "TINY", "tradable": True}])
+
+    universe = broker.universe()
+
+    assert "SPY" in universe
+    assert "AAPL" in universe
+    assert "TINY" not in universe
 
 
 class CaptureBroker(BaseBroker):
@@ -1550,6 +2559,17 @@ class CaptureBroker(BaseBroker):
 
     def sell(self, symbol: str, qty=None) -> dict:
         return {"symbol": symbol, "qty": qty or 0, "filled_avg_price": 10.0, "status": "filled"}
+
+
+class PendingBuyBroker(CaptureBroker):
+    def buy(self, symbol: str, qty: int, stop_price=None, target_price=None) -> dict:
+        self.last_buy = {
+            "symbol": symbol,
+            "qty": qty,
+            "stop_price": stop_price,
+            "target_price": target_price,
+        }
+        return {"symbol": symbol, "qty": qty, "filled_avg_price": None, "status": "pending_new"}
 
 
 class ScalingBroker(BaseBroker):
@@ -1603,6 +2623,56 @@ def test_buy_candidates_passes_stop_and_target_to_broker(tmp_path: Path):
         "stop_price": 9.5,
         "target_price": 11.5,
     }
+
+
+def test_buy_candidates_skips_recently_sold_symbol_even_after_profit(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.rebuy_after_sell_cooldown_hours = 4
+    broker = CaptureBroker(settings)
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    db.record_trade("AAPL", "sell", 2, 10.5, "filled", "target hit", pnl_pct=5.0)
+    candidate = Candidate(
+        symbol="AAPL",
+        price=10.0,
+        final_score=90.0,
+        action="buy",
+        stop_price=9.5,
+        target_price=11.5,
+        reward_risk=2.0,
+        qty=2,
+    )
+
+    result = engine.buy_candidates([candidate])
+
+    assert result == []
+    assert broker.last_buy is None
+
+
+def test_buy_candidates_records_pending_buy_without_opening_position_meta(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    broker = PendingBuyBroker(settings)
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    candidate = Candidate(
+        symbol="AAPL",
+        price=10.0,
+        final_score=90.0,
+        action="buy",
+        stop_price=9.5,
+        target_price=11.5,
+        reward_risk=2.0,
+        qty=2,
+    )
+
+    result = engine.buy_candidates([candidate])
+    trades = db.recent_trades(5)
+
+    assert result == [{"symbol": "AAPL", "qty": 2.0, "price": 10.0, "status": "pending_new"}]
+    assert trades[0]["side"] == "buy"
+    assert trades[0]["status"] == "pending_new"
+    assert trades[0]["note"] == "entry pending"
+    assert db.get_position_meta("AAPL") is None
 
 
 def test_auto_scale_limits_grow_gradually_with_equity(tmp_path: Path):
@@ -1719,6 +2789,167 @@ def test_auto_scale_limits_throttle_on_drawdown_from_peak(tmp_path: Path):
     assert engine.dashboard_snapshot()["dynamic_controls"]["drawdown_pct"] == 25.0
 
 
+def test_candidate_from_bars_can_size_fractional_shares_when_needed(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.min_stock_price = 2
+    settings.max_stock_price = 0
+    settings.risk_per_trade_pct = 0.04
+    settings.max_position_pct = 0.25
+    settings.min_dollar_volume = 500_000
+    settings.__post_init__()
+    broker = LiquidityUniverseBroker(
+        settings,
+        {
+            "WINR": _bars(25.0, 200_000),
+        },
+    )
+    engine = TradingEngine(settings=settings, broker=broker, db=Database(settings.db_path))
+
+    candidate = engine._candidate_from_bars("WINR", broker.bars(["WINR"], 40)["WINR"], buying_power=1_000)
+
+    assert candidate is not None
+    assert candidate.qty > 0
+    assert candidate.qty != int(candidate.qty)
+
+
+def test_candidate_from_bars_downgrades_buy_when_analyst_consensus_is_hold(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.min_stock_price = 2
+    settings.max_stock_price = 0
+    settings.analyst_consensus_enabled = True
+    settings.analyst_consensus_block_hold = True
+    settings.min_dollar_volume = 500_000
+    settings.__post_init__()
+    broker = LiquidityUniverseBroker(
+        settings,
+        {
+            "WINR": _bars(25.0, 200_000),
+        },
+    )
+    engine = TradingEngine(settings=settings, broker=broker, db=Database(settings.db_path))
+
+    class FakeAnalystTracker:
+        def get(self, symbol: str):
+            assert symbol == "WINR"
+            return {
+                "symbol": "WINR",
+                "consensus": "Hold",
+                "target_upside_pct": 0.53,
+                "source": "stockanalysis",
+            }
+
+    engine._analyst_tracker = FakeAnalystTracker()
+
+    baseline_engine = TradingEngine(settings=settings, broker=broker, db=Database(tmp_path / "baseline.db"))
+    baseline_engine._analyst_tracker = None
+    baseline_candidate = baseline_engine._candidate_from_bars("WINR", broker.bars(["WINR"], 40)["WINR"], buying_power=1_000)
+    candidate = engine._candidate_from_bars("WINR", broker.bars(["WINR"], 40)["WINR"], buying_power=1_000)
+
+    assert baseline_candidate is not None
+    assert candidate is not None
+    assert candidate.action == "watch"
+    assert candidate.signal_usage["analyst_consensus"] == "Hold"
+    assert candidate.metrics["analyst_consensus_hold_signal"] == 1.0
+    assert candidate.metrics["analyst_target_upside_pct"] == 0.53
+    assert candidate.metrics["analyst_consensus_blocked"] == 1.0
+    assert candidate.analyst_scores["decision_support"] < baseline_candidate.analyst_scores["decision_support"]
+    assert "analyst consensus is Hold" in candidate.reasons[0]
+
+
+def test_candidate_from_bars_rewards_buy_consensus_in_decision_support(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.min_stock_price = 2
+    settings.max_stock_price = 0
+    settings.analyst_consensus_enabled = True
+    settings.analyst_consensus_block_hold = True
+    settings.min_dollar_volume = 500_000
+    settings.__post_init__()
+    broker = LiquidityUniverseBroker(
+        settings,
+        {
+            "WINR": _bars(25.0, 200_000),
+        },
+    )
+    engine = TradingEngine(settings=settings, broker=broker, db=Database(settings.db_path))
+
+    class FakeAnalystTracker:
+        def get(self, symbol: str):
+            assert symbol == "WINR"
+            return {
+                "symbol": "WINR",
+                "consensus": "Buy",
+                "target_upside_pct": 18.5,
+                "source": "stockanalysis",
+            }
+
+    engine._analyst_tracker = FakeAnalystTracker()
+
+    candidate = engine._candidate_from_bars("WINR", broker.bars(["WINR"], 40)["WINR"], buying_power=1_000)
+
+    assert candidate is not None
+    assert candidate.signal_usage["analyst_consensus"] == "Buy"
+    assert candidate.metrics["analyst_consensus_buy_signal"] == 1.0
+    assert candidate.metrics["analyst_target_upside_pct"] == 18.5
+    assert candidate.analyst_scores["decision_support"] >= 50
+
+
+def test_candidate_from_bars_skips_analyst_consensus_for_configured_etfs(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.min_stock_price = 2
+    settings.max_stock_price = 0
+    settings.analyst_consensus_enabled = True
+    settings.exclude_broad_market_etfs = False  # this test is about consensus skip, not exclusion
+    settings.min_dollar_volume = 500_000
+    settings.__post_init__()
+    broker = LiquidityUniverseBroker(
+        settings,
+        {
+            "SPY": _bars(25.0, 200_000),
+        },
+    )
+    engine = TradingEngine(settings=settings, broker=broker, db=Database(settings.db_path))
+
+    class FailingAnalystTracker:
+        def get(self, symbol: str):
+            raise AssertionError(f"analyst lookup should be skipped for {symbol}")
+
+    engine._analyst_tracker = FailingAnalystTracker()
+
+    candidate = engine._candidate_from_bars("SPY", broker.bars(["SPY"], 40)["SPY"], buying_power=1_000)
+
+    assert candidate is not None
+    assert candidate.signal_usage["analyst_consensus"] == "skipped"
+    assert candidate.metrics["analyst_target_upside_pct"] == 0.0
+    assert candidate.metrics["analyst_consensus_buy_signal"] == 0.0
+
+
+def test_candidate_from_bars_excludes_broad_market_etfs(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.min_stock_price = 2
+    settings.max_stock_price = 0
+    settings.min_dollar_volume = 500_000
+    settings.__post_init__()
+    broker = LiquidityUniverseBroker(
+        settings,
+        {"SPY": _bars(25.0, 200_000), "WINR": _bars(8.0, 200_000)},
+    )
+    engine = TradingEngine(settings=settings, broker=broker, db=Database(settings.db_path))
+
+    # A broad-market ETF is filtered out entirely (not a stock pick)...
+    assert engine._candidate_from_bars("SPY", broker.bars(["SPY"], 40)["SPY"], buying_power=1_000) is None
+    # ...while a real single name still produces a candidate.
+    assert engine._candidate_from_bars("WINR", broker.bars(["WINR"], 40)["WINR"], buying_power=1_000) is not None
+
+    # The exclusion is toggleable.
+    settings.exclude_broad_market_etfs = False
+    assert engine._candidate_from_bars("SPY", broker.bars(["SPY"], 40)["SPY"], buying_power=1_000) is not None
+
+
 class LiquidityUniverseBroker(BaseBroker):
     name = "liquidity-universe"
 
@@ -1756,9 +2987,125 @@ def _bars(price: float, volume: int, days: int = 40) -> list[dict]:
     return bars
 
 
+def _down_bars(price: float, volume: int, days: int = 60) -> list[dict]:
+    bars = []
+    for idx in range(days):
+        close = round(price * (1 - (idx / (days * 20))), 4)
+        bars.append({"t": f"2026-04-{(idx % 28) + 1:02d}", "o": close, "h": close * 1.01, "l": close * 0.99, "c": close, "v": volume})
+    return bars
+
+
+def test_profit_lock_pauses_new_buys(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.profit_lock_dollars = 10
+    broker = CaptureBroker(settings)
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    db.set_bot_state(f"daily_equity_anchor:{engine._today_et()}", "980")
+    candidate = Candidate(
+        symbol="AAPL",
+        price=10.0,
+        final_score=90.0,
+        action="buy",
+        stop_price=9.0,
+        target_price=12.0,
+        reward_risk=2.0,
+        qty=2,
+    )
+
+    result = engine.buy_candidates([candidate])
+
+    assert result == []
+    assert "daily profit lock" in engine._buying_pause_reason()
+    assert broker.last_buy is None
+
+
+def test_market_regime_filter_blocks_long_candidate_when_indexes_are_weak(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.market_regime_filter = True
+    settings.market_regime_short_window = 20
+    settings.market_regime_long_window = 50
+    settings.market_regime_limited_long_min_score = 101
+    settings.min_reward_risk = 1.2
+    broker = LiquidityUniverseBroker(
+        settings,
+        {
+            "SPY": _down_bars(500.0, 5_000_000),
+            "QQQ": _down_bars(450.0, 5_000_000),
+            "WINR": _bars(10.0, 2_000_000, days=60),
+        },
+    )
+    engine = TradingEngine(settings=settings, broker=broker, db=Database(settings.db_path))
+
+    candidate = engine._candidate_from_bars("WINR", broker.bars(["WINR"], 60)["WINR"], buying_power=1_000)
+
+    assert candidate is not None
+    assert candidate.action == "watch"
+    assert candidate.metrics["market_regime_blocked"] == 1.0
+    assert "market regime filter" in candidate.reasons[0]
+
+
+def test_market_regime_filter_allows_reduced_size_high_score_long_when_weak(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.market_regime_filter = True
+    settings.market_regime_short_window = 20
+    settings.market_regime_long_window = 50
+    settings.market_regime_limited_long_min_score = 55
+    settings.market_regime_limited_long_max_position_pct = 0.18
+    settings.max_position_pct = 0.40
+    settings.min_reward_risk = 1.2
+    broker = LiquidityUniverseBroker(
+        settings,
+        {
+            "SPY": _down_bars(500.0, 5_000_000),
+            "QQQ": _down_bars(450.0, 5_000_000),
+            "WINR": _bars(10.0, 2_000_000, days=60),
+        },
+    )
+    engine = TradingEngine(settings=settings, broker=broker, db=Database(settings.db_path))
+
+    candidate = engine._candidate_from_bars("WINR", broker.bars(["WINR"], 60)["WINR"], buying_power=1_000)
+
+    assert candidate is not None
+    assert candidate.action == "buy"
+    assert candidate.metrics["market_regime_blocked"] == 0.5
+    assert candidate.signal_usage["market_regime"].endswith("-limited")
+    assert "reduced-size starter" in candidate.reasons[0]
+    assert candidate.qty <= 18.0
+
+
+def test_shadow_mode_records_high_score_candidates_without_buying(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.shadow_mode_strategies = True
+    broker = CaptureBroker(settings)
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    candidate = Candidate(
+        symbol="AAPL",
+        price=10.0,
+        final_score=90.0,
+        action="buy",
+        stop_price=9.0,
+        target_price=12.0,
+        reward_risk=2.0,
+        qty=2,
+        analyst_scores={"momentum": 80.0},
+        signal_usage={"market_regime": "uptrend"},
+    )
+
+    shadow = engine._record_shadow_candidates([candidate], bought=[])
+    rows = db.recent_shadow_picks(days=1)
+
+    assert len(shadow) == 1
+    assert len(rows) == 1
+    assert rows[0]["symbol"] == "AAPL"
+    assert rows[0]["analysis"] == {"momentum": 80.0}
+
+
 def test_candidate_symbol_pool_prefilters_for_price_and_liquidity(tmp_path: Path):
     settings = Settings(data_dir=tmp_path)
     settings.broker_mode = "paper"
+    settings.live_universe_mode = "dynamic"
     settings.scan_limit = 3
     settings.candidate_limit = 3
     settings.min_stock_price = 2
@@ -1777,6 +3124,7 @@ def test_candidate_symbol_pool_prefilters_for_price_and_liquidity(tmp_path: Path
         },
     )
     engine = TradingEngine(settings=settings, broker=broker, db=Database(settings.db_path))
+    engine.polygon = None
 
     pool = engine._candidate_symbol_pool()
 
@@ -1785,6 +3133,34 @@ def test_candidate_symbol_pool_prefilters_for_price_and_liquidity(tmp_path: Path
     assert "JUNK1" not in pool
     assert "JUNK2" not in pool
     assert "HIGH1" not in pool
+
+
+def test_candidate_symbol_pool_allows_higher_priced_names_when_max_stock_price_disabled(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.live_universe_mode = "dynamic"
+    settings.scan_limit = 3
+    settings.candidate_limit = 3
+    settings.min_stock_price = 2
+    settings.max_stock_price = 0
+    settings.min_dollar_volume = 1_000_000
+    settings.__post_init__()
+    broker = LiquidityUniverseBroker(
+        settings,
+        {
+            "LOW1": _bars(4.0, 600_000),
+            "HIGH1": _bars(24.0, 200_000),
+            "HIGH2": _bars(40.0, 90_000),
+        },
+    )
+    engine = TradingEngine(settings=settings, broker=broker, db=Database(settings.db_path))
+    engine.polygon = None
+
+    pool = engine._candidate_symbol_pool()
+
+    assert "LOW1" in pool
+    assert "HIGH1" in pool
+    assert "HIGH2" in pool
 
 
 class FailingScanBroker(BaseBroker):
@@ -1820,12 +3196,145 @@ def test_scan_market_returns_empty_list_when_provider_data_fetch_fails(tmp_path:
     settings.broker_mode = "paper"
     settings.scan_limit = 5
     settings.__post_init__()
+    settings.polygon_api_key = ""
+    settings.analyst_consensus_enabled = False
     engine = TradingEngine(settings=settings, broker=FailingScanBroker(settings), db=Database(settings.db_path))
 
     result = engine.scan_market()
 
     assert result == []
     assert engine.db.latest_candidates() == []
+
+
+def test_candidate_from_bars_requires_strong_buy_consensus(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.min_stock_price = 2
+    settings.max_stock_price = 0
+    settings.analyst_consensus_enabled = True
+    settings.analyst_consensus_require_strong_buy = True
+    settings.min_dollar_volume = 500_000
+    settings.__post_init__()
+    broker = LiquidityUniverseBroker(
+        settings,
+        {
+            "WINR": _bars(25.0, 200_000),
+        },
+    )
+    engine = TradingEngine(settings=settings, broker=broker, db=Database(settings.db_path))
+
+    class FakeAnalystTracker:
+        def __init__(self, consensus):
+            self.consensus = consensus
+
+        def get(self, symbol: str):
+            if self.consensus is None:
+                return None
+            return {
+                "symbol": symbol,
+                "consensus": self.consensus,
+                "target_upside_pct": 18.5,
+                "source": "stockanalysis",
+            }
+
+    bars = broker.bars(["WINR"], 40)["WINR"]
+
+    engine._analyst_tracker = FakeAnalystTracker("Buy")
+    plain_buy = engine._candidate_from_bars("WINR", bars, buying_power=1_000)
+    assert plain_buy is not None
+    assert plain_buy.action == "watch"
+    assert plain_buy.metrics["analyst_consensus_blocked"] == 1.0
+    assert "only Strong Buy" in plain_buy.reasons[0]
+
+    engine._analyst_tracker = FakeAnalystTracker("Strong Buy")
+    strong_buy = engine._candidate_from_bars("WINR", bars, buying_power=1_000)
+    assert strong_buy is not None
+    assert strong_buy.metrics["analyst_consensus_blocked"] == 0.0
+
+    engine._analyst_tracker = FakeAnalystTracker(None)
+    no_consensus = engine._candidate_from_bars("WINR", bars, buying_power=1_000)
+    assert no_consensus is not None
+    assert no_consensus.action == "watch"
+    assert no_consensus.metrics["analyst_consensus_blocked"] == 1.0
+
+    settings.analyst_consensus_require_strong_buy = False
+    engine._analyst_tracker = FakeAnalystTracker("Buy")
+    gate_off = engine._candidate_from_bars("WINR", bars, buying_power=1_000)
+    assert gate_off is not None
+    assert gate_off.metrics["analyst_consensus_blocked"] == 0.0
+
+
+def test_manage_positions_rotates_out_excluded_broad_market_etfs(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+
+    first = engine.trade_once()
+    assert first["bought"]
+    symbol = first["bought"][0]["symbol"]
+
+    # Treat the held symbol as a broad-market ETF bought before the exclusion
+    # deployed, held long enough that the rotation sell is never a day trade.
+    settings.exclude_broad_market_etfs = True
+    settings.broad_market_etfs = [symbol]
+    with engine.db.connect() as con:
+        con.execute(
+            "UPDATE position_meta SET opened_at=? WHERE symbol=?",
+            ((datetime.now(timezone.utc) - timedelta(days=3)).isoformat(), symbol),
+        )
+
+    sold = engine.manage_positions()
+
+    assert any(
+        item["symbol"] == symbol and "rotating out of excluded broad-market ETF" in str(item.get("note", ""))
+        for item in sold
+    )
+
+
+def test_manage_positions_does_not_rotate_same_day_positions(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+
+    first = engine.trade_once()
+    assert first["bought"]
+    symbol = first["bought"][0]["symbol"]
+
+    settings.exclude_broad_market_etfs = True
+    settings.broad_market_etfs = [symbol]
+
+    sold = engine.manage_positions()
+
+    assert not any("rotating out" in str(item.get("note", "")) for item in sold)
+
+
+def test_buy_candidates_respects_cash_buffer(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.cash_buffer_pct = 1.0  # reserve all equity: nothing is affordable
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+
+    candidates = engine.scan_market()
+    assert any(c.action == "buy" for c in candidates)
+
+    bought = engine.buy_candidates(candidates)
+
+    assert bought == []
+
+
+def test_scan_market_checks_regime_before_candidate_bars(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+    calls: list[str] = []
+
+    original_regime = engine._market_regime_status
+    original_fetch = engine._fetch_bars
+    engine._market_regime_status = lambda: calls.append("regime") or original_regime()  # type: ignore[method-assign]
+    engine._fetch_bars = lambda symbols, days: calls.append("bars") or original_fetch(symbols, days)  # type: ignore[method-assign]
+
+    engine.scan_market()
+
+    # The 2-symbol regime read must happen before the big candidate bar burst,
+    # otherwise rate limiting reads as regime "missing" and blocks all buys.
+    assert "regime" in calls and "bars" in calls
+    assert calls.index("regime") < calls.index("bars")
 
 
 class BrokerManagedExitBroker(BaseBroker):
@@ -1925,6 +3434,40 @@ def test_learning_update_caps_single_outlier_loss(tmp_path: Path):
     assert weights["momentum"]["weight"] > 0.2
 
 
+def test_learning_differentiates_strategies_by_conviction(tmp_path: Path):
+    db = Database(tmp_path / "tradebot.db")
+
+    # A winning trade that momentum strongly endorsed (95) but risk doubted (20).
+    db.update_learning({"momentum": 95.0, "risk": 20.0}, 12.0)
+    weights = db.learning_weights()
+
+    # The strategy that endorsed the winner is trusted more; the doubter is not.
+    assert weights["momentum"]["weight"] > 1.0
+    assert weights["risk"]["weight"] < weights["momentum"]["weight"]
+    # The whole point: weights are no longer identical across strategies.
+    assert weights["momentum"]["weight"] != weights["risk"]["weight"]
+
+
+def test_learning_reset_v2_wipes_corrupted_counts(tmp_path: Path):
+    path = tmp_path / "tradebot.db"
+    db = Database(path)
+
+    # Simulate the corrupted/saturated table the old retro loop produced.
+    with db.connect() as con:
+        con.execute("UPDATE learning SET wins = 99999, losses = 99999, weight = 0.25")
+        con.execute("DELETE FROM bot_state WHERE key = 'learning_reset_v2'")
+
+    # Re-opening runs the one-time migration, which wipes the bad counts.
+    healed = Database(path).learning_weights()
+    assert all(row["wins"] == 0 and row["losses"] == 0 and row["weight"] == 1.0 for row in healed.values())
+
+    # It must not fire a second time and clobber real learning.
+    db_again = Database(path)
+    db_again.update_learning({"momentum": 95.0}, 10.0)
+    reopened = Database(path).learning_weights()
+    assert reopened["momentum"]["wins"] == 1
+
+
 class PositionBroker(BaseBroker):
     name = "positions"
 
@@ -1962,6 +3505,261 @@ class PositionBroker(BaseBroker):
         return 1
 
 
+class ProtectivePositionBroker(PositionBroker):
+    def __init__(
+        self,
+        settings: Settings,
+        positions: list[PositionSnapshot] | None = None,
+        exit_orders: list[dict] | None = None,
+    ) -> None:
+        super().__init__(settings, positions)
+        self.exit_orders = exit_orders or []
+        self.protective_calls = []
+
+    def open_exit_orders_for_symbol(self, symbol: str):
+        return list(self.exit_orders)
+
+    def submit_protective_exit(self, symbol: str, qty: float, stop_price: float, target_price: float | None = None):
+        self.protective_calls.append((symbol, qty, stop_price, target_price))
+        return {"symbol": symbol, "status": "accepted", "order_class": "oco"}
+
+
+class FreshPriceProtectiveBroker(ProtectivePositionBroker):
+    def __init__(
+        self,
+        settings: Settings,
+        positions: list[PositionSnapshot] | None = None,
+        prices: dict[str, list[float]] | None = None,
+    ) -> None:
+        super().__init__(settings, positions)
+        self.prices = {symbol: list(values) for symbol, values in (prices or {}).items()}
+
+    def latest_prices(self, symbols):
+        result = {}
+        for symbol in symbols:
+            values = self.prices.get(symbol)
+            if values:
+                result[symbol] = values.pop(0) if len(values) > 1 else values[0]
+            else:
+                result.update(super().latest_prices([symbol]))
+        return result
+
+
+class RejectingProtectiveBroker(FreshPriceProtectiveBroker):
+    def submit_protective_exit(self, symbol: str, qty: float, stop_price: float, target_price: float | None = None):
+        self.protective_calls.append((symbol, qty, stop_price, target_price))
+        raise ProviderError(
+            'Alpaca request failed: Alpaca error 422: {"message":"stop price must be less than current price"}'
+        )
+
+
+def test_manage_positions_liquidates_when_daily_dollar_loss_limit_hit(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.daily_loss_limit_dollars = 20
+    settings.liquidate_on_daily_loss = True
+    position = PositionSnapshot(
+        symbol="AAPL",
+        qty=2,
+        avg_entry_price=10.0,
+        current_price=11.0,
+        market_value=22.0,
+        unrealized_pl_pct=10.0,
+    )
+    broker = PositionBroker(settings, [position])
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    db.set_bot_state(f"daily_equity_anchor:{engine._today_et()}", "1100")
+    db.open_position_meta("AAPL", 2, 10.0, 9.0, 12.0, {"momentum": 100.0})
+
+    sold = engine.manage_positions()
+
+    assert sold
+    assert sold[0]["symbol"] == "AAPL"
+    assert sold[0]["note"].startswith("daily loss limit")
+    assert broker.sell_calls == [("AAPL", 2.0)]
+    assert db.get_position_meta("AAPL") is None
+
+
+def test_manage_positions_waits_for_market_open_before_daily_loss_liquidation(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.alpaca_key_id = "key"
+    settings.alpaca_secret_key = "secret"
+    settings.daily_loss_limit_dollars = 20
+    settings.liquidate_on_daily_loss = True
+    settings.__post_init__()
+    position = PositionSnapshot(
+        symbol="AAPL",
+        qty=2,
+        avg_entry_price=10.0,
+        current_price=11.0,
+        market_value=22.0,
+        unrealized_pl_pct=10.0,
+    )
+    broker = PositionBroker(settings, [position])
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    engine._market_is_closed = lambda: True  # type: ignore[method-assign]
+    db.set_bot_state(f"daily_equity_anchor:{engine._today_et()}", "1100")
+    db.open_position_meta("AAPL", 2, 10.0, 9.0, 12.0, {"momentum": 100.0})
+
+    sold = engine.manage_positions()
+
+    assert sold == []
+    assert broker.sell_calls == []
+    assert db.get_position_meta("AAPL") is not None
+
+
+def test_manage_positions_recreates_missing_protective_exit(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.alpaca_key_id = "key"
+    settings.alpaca_secret_key = "secret"
+    settings.use_broker_protective_orders = True
+    settings.stop_loss_pct = 0.05
+    settings.__post_init__()
+    position = PositionSnapshot(
+        symbol="AAPL",
+        qty=2,
+        avg_entry_price=10.0,
+        current_price=10.5,
+        market_value=21.0,
+        unrealized_pl_pct=5.0,
+    )
+    broker = ProtectivePositionBroker(settings, [position])
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    db.open_position_meta("AAPL", 2, 10.0, 9.0, 12.0, {"momentum": 100.0})
+
+    sold = engine.manage_positions()
+
+    assert sold == []
+    assert broker.protective_calls == [("AAPL", 2.0, 9.5, 12.0)]
+    assert broker.cancel_calls == []
+
+
+def test_manage_positions_defers_tiny_protective_stop_ratchet(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.alpaca_key_id = "key"
+    settings.alpaca_secret_key = "secret"
+    settings.use_broker_protective_orders = True
+    settings.stop_loss_pct = 0.05
+    settings.trailing_stop_pct = 0.10
+    settings.protective_stop_replace_min_step_pct = 0.01
+    settings.__post_init__()
+    position = PositionSnapshot(
+        symbol="AAPL",
+        qty=2,
+        avg_entry_price=10.0,
+        current_price=10.8,
+        market_value=21.6,
+        unrealized_pl_pct=8.0,
+    )
+    broker = ProtectivePositionBroker(settings, [position], exit_orders=[{"symbol": "AAPL", "side": "sell", "stop_price": 9.65}])
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    db.open_position_meta("AAPL", 2, 10.0, 9.5, 12.0, {"momentum": 100.0})
+
+    sold = engine.manage_positions()
+
+    assert sold == []
+    assert broker.cancel_calls == []
+    assert broker.protective_calls == []
+
+
+def test_manage_positions_replaces_material_protective_stop_ratchet(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.alpaca_key_id = "key"
+    settings.alpaca_secret_key = "secret"
+    settings.use_broker_protective_orders = True
+    settings.stop_loss_pct = 0.05
+    settings.trailing_stop_pct = 0.10
+    settings.protective_stop_replace_min_step_pct = 0.01
+    settings.__post_init__()
+    position = PositionSnapshot(
+        symbol="AAPL",
+        qty=2,
+        avg_entry_price=10.0,
+        current_price=10.8,
+        market_value=21.6,
+        unrealized_pl_pct=8.0,
+    )
+    broker = ProtectivePositionBroker(settings, [position], exit_orders=[{"symbol": "AAPL", "side": "sell", "stop_price": 9.5}])
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    db.open_position_meta("AAPL", 2, 10.0, 9.5, 12.0, {"momentum": 100.0})
+
+    sold = engine.manage_positions()
+
+    assert sold == []
+    assert broker.cancel_calls == ["AAPL"]
+    assert broker.protective_calls == [("AAPL", 2.0, 9.72, 12.0)]
+
+
+def test_manage_positions_sells_when_fresh_price_breaches_protective_stop(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.alpaca_key_id = "key"
+    settings.alpaca_secret_key = "secret"
+    settings.use_broker_protective_orders = True
+    settings.stop_loss_pct = 0.05
+    settings.__post_init__()
+    position = PositionSnapshot(
+        symbol="AAPL",
+        qty=2,
+        avg_entry_price=10.0,
+        current_price=10.5,
+        market_value=21.0,
+        unrealized_pl_pct=5.0,
+    )
+    broker = FreshPriceProtectiveBroker(settings, [position], prices={"AAPL": [10.5, 9.4]})
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    db.open_position_meta("AAPL", 2, 10.0, 9.5, 12.0, {"momentum": 100.0})
+
+    sold = engine.manage_positions()
+
+    assert sold
+    assert sold[0]["symbol"] == "AAPL"
+    assert sold[0]["note"] == "protective stop already breached"
+    assert broker.protective_calls == []
+    assert broker.sell_calls == [("AAPL", 2.0)]
+    assert db.get_position_meta("AAPL") is None
+
+
+def test_manage_positions_sells_when_protective_stop_rejected_as_above_market(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.alpaca_key_id = "key"
+    settings.alpaca_secret_key = "secret"
+    settings.use_broker_protective_orders = True
+    settings.stop_loss_pct = 0.05
+    settings.__post_init__()
+    position = PositionSnapshot(
+        symbol="AAPL",
+        qty=2,
+        avg_entry_price=10.0,
+        current_price=10.5,
+        market_value=21.0,
+        unrealized_pl_pct=5.0,
+    )
+    broker = RejectingProtectiveBroker(settings, [position], prices={"AAPL": [10.5, 10.5, 9.4]})
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    db.open_position_meta("AAPL", 2, 10.0, 9.5, 12.0, {"momentum": 100.0})
+
+    sold = engine.manage_positions()
+
+    assert sold
+    assert sold[0]["symbol"] == "AAPL"
+    assert sold[0]["note"] == "protective stop already breached"
+    assert broker.protective_calls == [("AAPL", 2.0, 9.5, 12.0)]
+    assert broker.sell_calls == [("AAPL", 2.0)]
+    assert db.get_position_meta("AAPL") is None
+
+
 def test_manage_positions_respects_min_hold_days_for_target_exit(tmp_path: Path):
     settings = make_settings(tmp_path)
     settings.min_hold_days = 3
@@ -1982,6 +3780,30 @@ def test_manage_positions_respects_min_hold_days_for_target_exit(tmp_path: Path)
 
     assert sold == []
     assert broker.sell_calls == []
+
+
+def test_manage_positions_sells_target_hit_after_min_hold(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.min_hold_days = 0
+    position = PositionSnapshot(
+        symbol="AAPL",
+        qty=2,
+        avg_entry_price=10.0,
+        current_price=12.0,
+        market_value=24.0,
+        unrealized_pl_pct=20.0,
+    )
+    broker = PositionBroker(settings, [position])
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    db.open_position_meta("AAPL", 2, 10.0, 9.0, 11.0, {"momentum": 100.0})
+
+    sold = engine.manage_positions()
+
+    assert sold
+    assert sold[0]["symbol"] == "AAPL"
+    assert sold[0]["note"] == "target hit"
+    assert broker.sell_calls == [("AAPL", 2.0)]
 
 
 def test_buy_candidates_respects_capital_and_position_limits(tmp_path: Path):
@@ -2123,6 +3945,35 @@ def test_reconcile_broker_state_syncs_partial_fill_qty(tmp_path: Path):
     assert float(meta["qty"]) == 3.0
 
 
+def test_manage_positions_clears_stale_pending_exit(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.alpaca_key_id = "key"
+    settings.alpaca_secret_key = "secret"
+    settings.use_broker_protective_orders = False
+    settings.__post_init__()
+    position = PositionSnapshot(
+        symbol="AAPL",
+        qty=2,
+        avg_entry_price=10.0,
+        current_price=10.5,
+        market_value=21.0,
+        unrealized_pl_pct=5.0,
+    )
+    broker = PositionBroker(settings, [position])
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    db.open_position_meta("AAPL", 2, 10.0, 9.0, 12.0, {"momentum": 100.0})
+    db.set_exit_pending("AAPL", True)
+
+    notes = engine.manage_positions()
+    meta = db.get_position_meta("AAPL")
+
+    assert notes == [{"symbol": "AAPL", "note": "cleared stale pending exit"}]
+    assert meta is not None
+    assert meta["exit_pending"] == 0
+
+
 def test_buy_candidates_stores_stop_at_or_above_loss_cap_from_fill(tmp_path: Path):
     settings = make_settings(tmp_path)
     settings.stop_loss_pct = 0.10
@@ -2175,7 +4026,6 @@ def test_manage_positions_enforces_percent_loss_cap_when_stored_stop_is_looser(t
 class PendingSellBroker(PositionBroker):
     def sell(self, symbol: str, qty=None) -> dict:
         self.sell_calls.append((symbol, qty))
-        self._positions = [position for position in self._positions if position.symbol != symbol]
         return {"symbol": symbol, "qty": None, "filled_avg_price": None, "status": "accepted"}
 
 
@@ -2204,9 +4054,10 @@ def test_manage_positions_handles_unfilled_sell_response(tmp_path: Path):
     after = engine.learning_weights()
 
     assert sold
-    assert trades[0]["status"] == "filled"  # async sells now treated as filled
+    assert trades[0]["status"] == "accepted"
     assert trades[0]["qty"] == 2.0
     assert trades[0]["price"] == 8.99
-    assert trades[0]["pnl_pct"] is not None  # P&L is now calculated immediately
-    assert meta is None  # position meta closed immediately
-    assert after != before  # learning weights SHOULD update now
+    assert trades[0]["pnl_pct"] is None
+    assert meta is not None
+    assert meta["exit_pending"] == 1
+    assert after == before

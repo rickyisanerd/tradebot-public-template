@@ -30,6 +30,8 @@
 </head>
 <body>
 <div class="wrap">
+  {% set today_pnl = account.equity - safety_status.daily_equity_anchor %}
+  {% set today_pct = (today_pnl / safety_status.daily_equity_anchor * 100) if safety_status.daily_equity_anchor > 0 else 0 %}
   <h1>TradeBot Dashboard</h1>
   <p class="muted">Mode: {{ mode }} | Provider: {{ provider }} | Auto trade: {% if auto_trade_enabled %}on every {{ auto_trade_interval_minutes }} minute(s){% else %}off{% endif %}.</p>
   {% if degraded_mode %}
@@ -44,6 +46,7 @@
     <form method="post" action="/trade-once"><button>Trade Once</button></form>
     <form method="post" action="/refresh-signals"><button>Refresh Signals</button></form>
     <form method="post" action="/refresh-congress"><button>Refresh Congress</button></form>
+    <form method="post" action="/mirror-now"><button>Run Mirror</button></form>
   </div>
 
   <div class="row">
@@ -54,17 +57,38 @@
   </div>
 
   <div class="row">
-    <div class="card"><div class="muted">Realized P&L</div><h2>${{ '%.2f'|format(performance.realized_pnl) }}</h2></div>
-    <div class="card"><div class="muted">Unrealized P&L</div><h2>${{ '%.2f'|format(performance.unrealized_pnl) }}</h2></div>
-    <div class="card"><div class="muted">Tracked P&L</div><h2>${{ '%.2f'|format(performance.total_pnl) }}</h2></div>
-    <div class="card"><div class="muted">Return vs Baseline</div><h2>{{ '%.2f'|format(performance.total_return_pct) }}%</h2></div>
+    <div class="card">
+      <div class="muted">Today P&L</div>
+      <h2>${{ '%.2f'|format(today_pnl) }}</h2>
+      <div class="muted">vs start-of-day equity: {{ '%.2f'|format(today_pct) }}%</div>
+    </div>
+    <div class="card">
+      <div class="muted">Open Positions P&L</div>
+      <h2>${{ '%.2f'|format(performance.unrealized_pnl) }}</h2>
+      <div class="muted">Unrealized on current holdings</div>
+    </div>
+    <div class="card">
+      <div class="muted">All-Time Tracked P&L</div>
+      <h2>${{ '%.2f'|format(performance.total_pnl) }}</h2>
+      <div class="muted">Realized + open-position P&L</div>
+    </div>
+    <div class="card">
+      <div class="muted">Return vs Starting Baseline</div>
+      <h2>{{ '%.2f'|format(performance.total_return_pct) }}%</h2>
+      <div class="muted">Using baseline equity of ${{ '%.2f'|format(performance.baseline_equity) }}</div>
+    </div>
   </div>
 
   <div class="grid-2">
     <div class="card">
-      <h2>Performance summary</h2>
+      <h2>Performance Summary</h2>
+      <p class="muted">Quick read: `Today P&L` is just today. `All-Time Tracked P&L` is the bigger lifetime-style number.</p>
       <table>
         <tbody>
+          <tr><th>Today P&L</th><td>${{ '%.2f'|format(today_pnl) }} ({{ '%.2f'|format(today_pct) }}%)</td></tr>
+          <tr><th>Closed-trade realized P&L</th><td>${{ '%.2f'|format(performance.realized_pnl) }}</td></tr>
+          <tr><th>Open-position unrealized P&L</th><td>${{ '%.2f'|format(performance.unrealized_pnl) }}</td></tr>
+          <tr><th>All-time tracked P&L</th><td>${{ '%.2f'|format(performance.total_pnl) }}</td></tr>
           <tr><th>Baseline equity</th><td>${{ '%.2f'|format(performance.baseline_equity) }}</td></tr>
           <tr><th>High-water mark</th><td>${{ '%.2f'|format(performance.peak_equity) }}</td></tr>
           <tr><th>Open cost basis</th><td>${{ '%.2f'|format(performance.open_cost_basis) }}</td></tr>
@@ -107,6 +131,24 @@
 
   <div class="grid-2">
     <div class="card">
+      <h2>E*TRADE mirror</h2>
+      {% if mirror_status.auth_expired %}
+      <p class="warn">{{ mirror_status.recovery_hint }}</p>
+      {% endif %}
+      <table>
+        <tbody>
+          <tr><th>Enabled</th><td>{% if mirror_status.enabled %}<span class="ok">Yes</span>{% else %}<span class="warn">No</span>{% endif %}</td></tr>
+          <tr><th>Environment</th><td>{{ mirror_status.env }}</td></tr>
+          <tr><th>Preview only</th><td>{{ mirror_status.preview_only }}</td></tr>
+          <tr><th>Account</th><td>{{ mirror_status.account_id_key or '-' }}</td></tr>
+          <tr><th>Last mirrored trade id</th><td>{{ mirror_status.last_trade_id }}</td></tr>
+          <tr><th>Last result</th><td>{{ mirror_status.last_result or '-' }}</td></tr>
+          <tr><th>Last error</th><td>{{ mirror_status.last_error or '-' }}</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
       <h2>Dynamic controls</h2>
       <table>
         <tbody>
@@ -115,7 +157,7 @@
           <tr><th>Max total capital</th><td>${{ '%.2f'|format(dynamic_controls.max_total_capital) }}</td></tr>
           <tr><th>Max open positions</th><td>{{ dynamic_controls.max_open_positions }}</td></tr>
           <tr><th>Max new positions/run</th><td>{{ dynamic_controls.max_new_positions_per_run }}</td></tr>
-          <tr><th>Max stock price</th><td>${{ '%.2f'|format(dynamic_controls.max_stock_price) }}</td></tr>
+          <tr><th>Max stock price</th><td>{% if dynamic_controls.max_stock_price > 0 %}${{ '%.2f'|format(dynamic_controls.max_stock_price) }}{% else %}No cap{% endif %}</td></tr>
           <tr><th>Min dollar volume</th><td>${{ '{:,.0f}'.format(dynamic_controls.min_dollar_volume) }}</td></tr>
           <tr><th>Scan limit</th><td>{{ dynamic_controls.scan_limit }}</td></tr>
           <tr><th>Candidate limit</th><td>{{ dynamic_controls.candidate_limit }}</td></tr>
@@ -124,7 +166,9 @@
         </tbody>
       </table>
     </div>
+  </div>
 
+  <div class="grid-2">
     <div class="card">
       <h2>Market and safety</h2>
       <table>
@@ -136,7 +180,10 @@
           <tr><th>Next open</th><td>{{ market_session.next_open[:19].replace('T', ' ') if market_session.next_open else '-' }}</td></tr>
           <tr><th>Buy status</th><td>{% if safety_status.pause_new_buys %}<span class="warn">Paused</span>{% else %}<span class="ok">Active</span>{% endif %}</td></tr>
           <tr><th>Daily equity anchor</th><td>${{ '%.2f'|format(safety_status.daily_equity_anchor) }}</td></tr>
-          <tr><th>Daily loss</th><td>{{ '%.2f'|format(safety_status.daily_loss_pct) }}%</td></tr>
+          <tr><th>Anchor source</th><td>{{ safety_status.daily_equity_anchor_source }}</td></tr>
+          <tr><th>Daily P&L</th><td>${{ '%.2f'|format(safety_status.daily_pnl_amount) }}</td></tr>
+          <tr><th>Daily loss</th><td>${{ '%.2f'|format(safety_status.daily_loss_amount) }} / {{ '%.2f'|format(safety_status.daily_loss_pct) }}%</td></tr>
+          <tr><th>Daily profit</th><td>${{ '%.2f'|format(safety_status.daily_profit_amount) }}</td></tr>
           <tr><th>Buy errors</th><td>{{ safety_status.consecutive_buy_errors }}</td></tr>
         </tbody>
       </table>
@@ -144,6 +191,25 @@
       <div style="margin-top: 12px;">
         {% for reason in safety_status.reasons %}
         <span class="pill">{{ reason }}</span>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <h2>Market regime</h2>
+      <table>
+        <tbody>
+          <tr><th>Filter</th><td>{% if market_regime.enabled %}<span class="ok">Enabled</span>{% else %}<span class="muted">Disabled</span>{% endif %}</td></tr>
+          <tr><th>State</th><td class="{% if market_regime.allow_long_buys %}ok{% elif market_regime.enabled %}warn{% else %}muted{% endif %}">{{ market_regime.state }}</td></tr>
+          <tr><th>Long buys</th><td>{% if market_regime.allow_long_buys %}<span class="ok">Allowed</span>{% else %}<span class="warn">Blocked</span>{% endif %}</td></tr>
+          <tr><th>Reason</th><td>{{ market_regime.reason }}</td></tr>
+        </tbody>
+      </table>
+      {% if market_regime.details %}
+      <div style="margin-top: 12px;">
+        {% for item in market_regime.details %}
+        <span class="pill">{{ item.symbol }}: {{ item.state }}{% if item.latest %} ${{ '%.2f'|format(item.latest) }}{% endif %}</span>
         {% endfor %}
       </div>
       {% endif %}
@@ -176,7 +242,7 @@
             </td>
           </tr>
           {% else %}
-          <tr><td colspan="8" class="muted">No scan results yet.</td></tr>
+          <tr><td colspan="8" class="muted">No scan results yet. Hit Run Scan and let the little goblin think.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -195,6 +261,66 @@
             <td>{{ item.losses }}</td>
             <td>{{ '%.2f'|format(item.total_return) }}</td>
           </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>Weekly signal performance</h2>
+      <p class="muted">Last {{ weekly_signal_performance.days }} day(s), based on realized sells and shadow candidates.</p>
+      <table>
+        <thead><tr><th>Actual strategy</th><th>Count</th><th>Wins</th><th>Losses</th><th>Avg P&L</th></tr></thead>
+        <tbody>
+          {% for item in weekly_signal_performance.realized_strategies %}
+          <tr>
+            <td>{{ item.name }}</td>
+            <td>{{ item.count }}</td>
+            <td>{{ item.wins }}</td>
+            <td>{{ item.losses }}</td>
+            <td>{{ '%.2f'|format(item.avg_pnl_pct) }}%</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="muted">No realized sells in the current window.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <table style="margin-top: 14px;">
+        <thead><tr><th>Shadow signal</th><th>Count</th><th>Wins</th><th>Losses</th><th>Avg P&L</th></tr></thead>
+        <tbody>
+          {% for item in weekly_signal_performance.shadow_signals[:8] %}
+          <tr>
+            <td>{{ item.name }}</td>
+            <td>{{ item.count }}</td>
+            <td>{{ item.wins }}</td>
+            <td>{{ item.losses }}</td>
+            <td>{{ '%.2f'|format(item.avg_pnl_pct) }}%</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="muted">No shadow signal data yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Shadow picks</h2>
+      <table>
+        <thead><tr><th>Time</th><th>Symbol</th><th>Score</th><th>Entry</th><th>Now</th><th>P&L</th></tr></thead>
+        <tbody>
+          {% for item in shadow_picks[:10] %}
+          <tr>
+            <td>{{ item.created_at[:19].replace('T', ' ') }}</td>
+            <td>{{ item.symbol }}</td>
+            <td>{{ '%.2f'|format(item.score) }}</td>
+            <td>${{ '%.2f'|format(item.price) }}</td>
+            <td>{% if item.current_price is not none %}${{ '%.2f'|format(item.current_price) }}{% else %}-{% endif %}</td>
+            <td>{% if item.pnl_pct is not none %}{{ '%.2f'|format(item.pnl_pct) }}%{% else %}-{% endif %}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6" class="muted">No shadow picks recorded yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -309,7 +435,7 @@
             <td>{{ item.filed_date }}</td>
           </tr>
           {% else %}
-          <tr><td colspan="6" class="muted">No congressional trades are cached yet.</td></tr>
+          <tr><td colspan="6" class="muted">No congressional trades are cached yet. Hit Refresh Congress to pull the latest official House/Senate filings (only trades under the price cap are kept).</td></tr>
           {% endfor %}
         </tbody>
       </table>

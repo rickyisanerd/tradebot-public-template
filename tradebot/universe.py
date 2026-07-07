@@ -43,3 +43,15 @@ DEFAULT_UNIVERSE = [
     # --- ETFs for sector exposure ---
     "IWM", "XLF", "XLE", "XBI", "ARKK", "SOXS", "LABU",
 ]
+
+
+LIQUID_LARGE_CAP_UNIVERSE = [
+    # Broad market and sector ETFs
+    "SPY", "QQQ", "IWM", "DIA", "VTI", "VOO", "XLK", "XLF", "XLE", "XLV", "XLY", "XLI",
+    # Mega-cap and highly liquid technology
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "NFLX", "CRM", "ADBE",
+    # Financials, consumer, and defensive large caps
+    "JPM", "BAC", "WFC", "V", "MA", "COST", "WMT", "HD", "MCD", "KO", "PEP", "DIS",
+    # Healthcare, industrials, energy, and telecom
+    "UNH", "LLY", "JNJ", "ABBV", "CAT", "GE", "XOM", "CVX", "T", "VZ",
+]

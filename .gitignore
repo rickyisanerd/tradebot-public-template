@@ -2,6 +2,8 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.etrade/
+*.etrade.tokens.json
 .pytest_tmp/
 pytest_tmp/
 .codex_tmp*/

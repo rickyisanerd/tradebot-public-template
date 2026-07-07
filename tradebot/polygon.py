@@ -4,8 +4,7 @@ Provides helpers that the trading engine can use to:
 1.  Discover the *entire* sub-$10 stock universe in a single API call
     (Daily Market Summary), replacing slow per-batch Alpaca screening.
 2.  Fetch short-volume data for squeeze-signal scoring.
-3.  Query the Fed inflation endpoint so we no longer scrape web pages for CPI.
-4.  Check upcoming market holidays to avoid placing orders after hours.
+3.  Check upcoming market holidays to avoid placing orders after hours.
 """
 
 from __future__ import annotations
@@ -162,22 +161,7 @@ class PolygonClient:
         return out
 
     # ------------------------------------------------------------------
-    # 3. Fed inflation data (replaces CPI scraping)
-    # ------------------------------------------------------------------
-
-    def inflation_data(self, limit: int = 6) -> List[dict]:
-        """GET /fed/v1/inflation — CPI, PCE, core variants.
-
-        Returns list of {date, cpi, cpi_core, pce, pce_core, pce_spending}.
-        """
-        payload = self._get(
-            "/fed/v1/inflation",
-            params={"limit": limit, "sort": "date.desc"},
-        )
-        return payload.get("results") or []
-
-    # ------------------------------------------------------------------
-    # 4. Market holidays / status
+    # 3. Market holidays / status
     # ------------------------------------------------------------------
 
     def upcoming_holidays(self) -> List[dict]:
@@ -191,7 +175,7 @@ class PolygonClient:
         return self._get("/v1/marketstatus/now")
 
     # ------------------------------------------------------------------
-    # 5. Historical bars (per ticker)
+    # 4. Historical bars (per ticker)
     # ------------------------------------------------------------------
 
     def bars(self, ticker: str, days: int = 80) -> List[dict]:

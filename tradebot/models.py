@@ -14,7 +14,7 @@ class Candidate(BaseModel):
     stop_price: float
     target_price: float
     reward_risk: float
-    qty: int = 0
+    qty: float = 0.0
     analyst_scores: Dict[str, float] = Field(default_factory=dict)
     metrics: Dict[str, float] = Field(default_factory=dict)
     signal_usage: Dict[str, str] = Field(default_factory=dict)
@@ -25,6 +25,7 @@ class AccountSnapshot(BaseModel):
     equity: float
     buying_power: float
     mode: str
+    last_equity: Optional[float] = None
 
 
 class PositionSnapshot(BaseModel):

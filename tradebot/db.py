@@ -161,6 +161,23 @@ class Database:
                     message TEXT NOT NULL,
                     details_json TEXT DEFAULT '{}'
                 );
+
+                CREATE TABLE IF NOT EXISTS shadow_picks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    strategy TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    qty REAL NOT NULL,
+                    stop_price REAL NOT NULL,
+                    target_price REAL NOT NULL,
+                    reward_risk REAL NOT NULL,
+                    score REAL NOT NULL,
+                    reason TEXT DEFAULT '',
+                    analysis_json TEXT DEFAULT '{}',
+                    signal_usage_json TEXT DEFAULT '{}'
+                );
                 """
             )
             columns = {row["name"] for row in con.execute("PRAGMA table_info(position_meta)").fetchall()}
@@ -186,6 +203,24 @@ class Database:
                     ON CONFLICT(strategy) DO NOTHING
                     """,
                     (strategy, utc_now()),
+                )
+            # One-time reset: earlier builds let the retroactive scan-learning
+            # loop flood this table with tens of thousands of phantom (simulated)
+            # outcomes, which pinned every weight to the floor. Wipe the corrupted
+            # counts once so weights start clean and only real closed trades move
+            # them from here on. Idempotent via a bot_state flag.
+            if con.execute("SELECT 1 FROM bot_state WHERE key = 'learning_reset_v2'").fetchone() is None:
+                con.execute(
+                    "UPDATE learning SET wins = 0, losses = 0, total_return = 0, weight = 1.0, updated_at = ?",
+                    (utc_now(),),
+                )
+                con.execute(
+                    """
+                    INSERT INTO bot_state(key, value, updated_at)
+                    VALUES ('learning_reset_v2', '1', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (utc_now(),),
                 )
 
     def record_scan(self, broker_mode: str, provider: str, candidates: List[Dict[str, Any]]) -> None:
@@ -430,7 +465,6 @@ class Database:
             ).fetchall()
 
         next_macro_days: int | None = None
-        cpi_count = 0
         fomc_count = 0
         for row in rows:
             event_date = datetime.strptime(row["event_date"], "%Y-%m-%d").date()
@@ -440,15 +474,12 @@ class Database:
             if days_until < 0:
                 continue
             next_macro_days = days_until if next_macro_days is None else min(next_macro_days, days_until)
-            if row["event_type"] == "cpi":
-                cpi_count += 1
-            elif row["event_type"] == "fomc":
+            if row["event_type"] == "fomc":
                 fomc_count += 1
 
         return {
             "days_until_macro_event": float(next_macro_days if next_macro_days is not None else window_days + 1),
             "has_near_macro_event": 1.0 if next_macro_days is not None else 0.0,
-            "near_cpi_count": float(cpi_count),
             "near_fomc_count": float(fomc_count),
         }
 
@@ -598,6 +629,72 @@ class Database:
             ).fetchone()
             return json.loads(row[0]) if row else []
 
+    def record_shadow_picks(self, strategy: str, candidates: List[Dict[str, Any]]) -> int:
+        today_prefix = datetime.now(timezone.utc).date().isoformat()
+        inserted = 0
+        with self.connect() as con:
+            for candidate in candidates:
+                symbol = str(candidate.get("symbol") or "").upper()
+                if not symbol:
+                    continue
+                exists = con.execute(
+                    """
+                    SELECT id FROM shadow_picks
+                    WHERE strategy = ? AND symbol = ? AND created_at LIKE ?
+                    LIMIT 1
+                    """,
+                    (strategy, symbol, f"{today_prefix}%"),
+                ).fetchone()
+                if exists:
+                    continue
+                con.execute(
+                    """
+                    INSERT INTO shadow_picks(
+                        created_at, strategy, symbol, action, price, qty, stop_price,
+                        target_price, reward_risk, score, reason, analysis_json, signal_usage_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        utc_now(),
+                        strategy,
+                        symbol,
+                        str(candidate.get("action") or "watch"),
+                        float(candidate.get("price") or 0.0),
+                        float(candidate.get("qty") or 0.0),
+                        float(candidate.get("stop_price") or 0.0),
+                        float(candidate.get("target_price") or 0.0),
+                        float(candidate.get("reward_risk") or 0.0),
+                        float(candidate.get("final_score") or 0.0),
+                        str(candidate.get("shadow_reason") or ""),
+                        json.dumps(candidate.get("analyst_scores") or {}),
+                        json.dumps(candidate.get("signal_usage") or {}),
+                    ),
+                )
+                inserted += 1
+        return inserted
+
+    def recent_shadow_picks(self, days: int = 7, limit: int = 100) -> List[Dict[str, Any]]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).isoformat()
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT *
+                FROM shadow_picks
+                WHERE created_at >= ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (cutoff, limit),
+            ).fetchall()
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            payload["analysis"] = json.loads(payload.pop("analysis_json") or "{}")
+            payload["signal_usage"] = json.loads(payload.pop("signal_usage_json") or "{}")
+            items.append(payload)
+        return items
+
     def recent_trades(self, limit: int = 20) -> List[Dict[str, Any]]:
         with self.connect() as con:
             rows = con.execute(
@@ -606,6 +703,21 @@ class Database:
                 (limit,),
             ).fetchall()
             return [dict(r) | {"analysis": json.loads(r["analysis_json"] or "{}")} for r in rows]
+
+    def recent_realized_sells(self, days: int = 7, limit: int = 200) -> List[Dict[str, Any]]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).isoformat()
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT id, created_at, symbol, side, qty, price, status, note, pnl_pct, pnl_amount, analysis_json
+                FROM trade_events
+                WHERE side = 'sell' AND pnl_pct IS NOT NULL AND created_at >= ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (cutoff, limit),
+            ).fetchall()
+        return [dict(r) | {"analysis": json.loads(r["analysis_json"] or "{}")} for r in rows]
 
     def trades_since_id(self, last_trade_id: int, limit: int = 100) -> List[Dict[str, Any]]:
         with self.connect() as con:
@@ -697,7 +809,8 @@ class Database:
                     entry_price=excluded.entry_price,
                     stop_price=excluded.stop_price,
                     target_price=excluded.target_price,
-                    analysis_json=excluded.analysis_json
+                    analysis_json=excluded.analysis_json,
+                    exit_pending=0
                 """,
                 (symbol, utc_now(), qty, entry_price, stop_price, target_price, json.dumps(analysis)),
             )
@@ -770,6 +883,19 @@ class Database:
             return {row["strategy"]: dict(row) for row in rows}
 
     def update_learning(self, analysis: Dict[str, float], pnl_pct: float) -> None:
+        """Update per-strategy weights from a *real* closed-trade outcome.
+
+        Each strategy scores a candidate 0-100 (50 = neutral). We credit or
+        blame a strategy in proportion to how strongly *it* endorsed the trade
+        (its "conviction"), not by the raw outcome. A strategy that loved a
+        winner — or correctly doubted a loser — builds edge; a strategy that
+        loved a loser loses weight. Neutral strategies (score ~50) barely move.
+        This is what makes the weights diverge so the blend can actually favour
+        the strategies that predict returns, instead of every strategy tracking
+        the same win/loss count.
+        """
+        bounded_pnl = max(-25.0, min(25.0, float(pnl_pct)))
+        norm_pnl = bounded_pnl / 20.0  # roughly [-1.25, 1.25]
         with self.connect() as con:
             for strategy, score in analysis.items():
                 row = con.execute(
@@ -778,19 +904,20 @@ class Database:
                 ).fetchone()
                 if not row:
                     continue
-                wins = row["wins"] + (1 if pnl_pct > 0 else 0)
-                losses = row["losses"] + (1 if pnl_pct <= 0 else 0)
-                # Adaptive learning: strategies that consistently pick winners
-                # get boosted faster; losers decay faster.  Wider bounds let the
-                # bot express stronger conviction once it has enough data.
-                bounded_pnl = max(-25.0, min(25.0, float(pnl_pct)))
-                contribution = (bounded_pnl / 20.0) * (float(score) / 100.0)
+                # +1.0 = max endorse, -1.0 = max skeptic, 0 = no opinion.
+                conviction = max(-1.0, min(1.0, (float(score) - 50.0) / 50.0))
+                # A strategy is "right" when its lean agreed with the result:
+                # endorsed (conviction>0) a winner, or doubted (conviction<0) a loser.
+                directional = conviction * bounded_pnl
+                wins = row["wins"] + (1 if directional > 0 else 0)
+                losses = row["losses"] + (1 if directional < 0 else 0)
+                # Conviction-weighted return is the running "edge" for the strategy.
+                contribution = conviction * norm_pnl
                 total_return = row["total_return"] + contribution
                 total_trades = wins + losses
-                # Scale the per-trade delta up once we have enough history so
-                # early noise doesn't over-steer, but mature weights move faster.
+                # Early outcomes steer gently; mature weights move faster.
                 maturity_factor = min(1.5, 0.8 + total_trades * 0.02)
-                weight = 1.0 + (wins - losses) * 0.08 * maturity_factor + total_return * 0.35
+                weight = 1.0 + total_return * 0.5 * maturity_factor
                 weight = max(0.25, min(3.0, weight))
                 con.execute(
                     """

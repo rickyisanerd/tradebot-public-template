@@ -87,7 +87,7 @@ def main() -> int:
     sub.add_parser("refresh-congress", help="Refresh cached congressional PTR trades from configured official report URLs")
     sub.add_parser("refresh-sec", help="Refresh cached SEC filing signals for the current scan universe")
     sub.add_parser("refresh-earnings", help="Refresh cached earnings events for the current scan universe")
-    sub.add_parser("refresh-macro", help="Refresh cached CPI and FOMC calendar events")
+    sub.add_parser("refresh-macro", help="Refresh cached FOMC calendar events")
     sub.add_parser("status", help="Print dashboard snapshot as JSON")
     sub.add_parser("dashboard", help="Run the FastAPI dashboard")
 

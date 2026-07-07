@@ -218,6 +218,28 @@ def analyze_decision_support(metrics: Dict[str, float]) -> Tuple[float, List[str
         score -= 6
         reasons.append("the move may already be a bit overextended")
 
+    analyst_buy_signal = metrics.get("analyst_consensus_buy_signal", 0.0)
+    analyst_hold_signal = metrics.get("analyst_consensus_hold_signal", 0.0)
+    analyst_sell_signal = metrics.get("analyst_consensus_sell_signal", 0.0)
+    analyst_target_upside_pct = metrics.get("analyst_target_upside_pct", 0.0)
+    if analyst_buy_signal > 0:
+        score += 8
+        reasons.append("analyst consensus is bullish enough to support the setup")
+    elif analyst_hold_signal > 0:
+        score -= 12
+        reasons.append("analyst consensus is Hold, so conviction looks muted")
+    elif analyst_sell_signal > 0:
+        score -= 18
+        reasons.append("analyst consensus leans bearish against the trade")
+
+    if analyst_target_upside_pct > 0:
+        if analyst_target_upside_pct >= 15:
+            score += 6
+            reasons.append("analyst price target leaves meaningful upside")
+        elif analyst_target_upside_pct < 5:
+            score -= 6
+            reasons.append("analyst price target leaves very little upside")
+
     congress_buy_count = metrics.get("congress_buy_count", 0.0)
     congress_sell_count = metrics.get("congress_sell_count", 0.0)
     congress_net_count = metrics.get("congress_net_count", 0.0)
@@ -292,7 +314,6 @@ def analyze_decision_support(metrics: Dict[str, float]) -> Tuple[float, List[str
     has_near_macro_event = metrics.get("has_near_macro_event", 0.0)
     days_until_macro_event = metrics.get("days_until_macro_event", 999.0)
     near_fomc_count = metrics.get("near_fomc_count", 0.0)
-    near_cpi_count = metrics.get("near_cpi_count", 0.0)
     macro_weight = max(0.0, metrics.get("macro_weight", 1.0))
     if has_near_macro_event:
         if days_until_macro_event <= 1:
@@ -307,9 +328,5 @@ def analyze_decision_support(metrics: Dict[str, float]) -> Tuple[float, List[str
             score -= 4 * macro_weight
             if macro_weight > 0:
                 reasons.append("FOMC timing can override single-name setups")
-        elif near_cpi_count > 0:
-            score -= 3 * macro_weight
-            if macro_weight > 0:
-                reasons.append("CPI timing can jolt the whole tape")
 
     return max(0.0, min(100.0, score)), reasons
