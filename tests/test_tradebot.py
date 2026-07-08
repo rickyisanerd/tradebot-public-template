@@ -35,8 +35,6 @@ def make_settings(tmp_path: Path) -> Settings:
     settings.max_position_pct = 0.10
     settings.min_reward_risk = 1.8
     settings.starting_cash = 100_000
-    # Pin the price cap so results don't depend on a local .env value
-    # (0 means uncapped; the default $10 cap excludes test bars near $10).
     settings.max_stock_price = 0.0
     settings.__post_init__()
     settings.congress_report_urls = []
@@ -4061,3 +4059,66 @@ def test_manage_positions_handles_unfilled_sell_response(tmp_path: Path):
     assert meta is not None
     assert meta["exit_pending"] == 1
     assert after == before
+
+
+def test_buy_errors_reset_at_next_session(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    db = Database(settings.db_path)
+    for _ in range(4):
+        db.record_trade("V", "buy", 0.001, 350.0, "error", "order rejected")
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=db)
+
+    assert engine._consecutive_buy_errors() == 4
+    assert engine._execution_safety_status()["pause_new_buys"] is True
+
+    stale = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    with db.connect() as con:
+        con.execute("UPDATE trade_events SET created_at = ?", (stale,))
+
+    assert engine._consecutive_buy_errors() == 0
+    assert engine._execution_safety_status()["pause_new_buys"] is False
+
+
+def test_buy_error_pause_sends_alert_email_once_per_day(tmp_path: Path, monkeypatch):
+    settings = make_settings(tmp_path)
+    db = Database(settings.db_path)
+    for _ in range(4):
+        db.record_trade("V", "buy", 0.001, 350.0, "error", "order rejected")
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=db)
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        "tradebot.email_report.send_failure_alert",
+        lambda *args, **kwargs: calls.append(args) or True,
+    )
+
+    status = engine._execution_safety_status()
+    engine._record_safety_transition(status)
+    assert len(calls) == 1
+    assert "consecutive buy errors" in calls[0][0]
+
+    # A second transition on the same day must not resend, even after restart.
+    engine._last_safety_signature = None
+    engine._record_safety_transition(status)
+    assert len(calls) == 1
+
+
+def test_tiny_notional_buys_are_skipped_not_submitted(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=db)
+    candidate = Candidate(
+        symbol="MA",
+        price=522.44,
+        final_score=90.0,
+        action="buy",
+        stop_price=500.0,
+        target_price=560.0,
+        reward_risk=2.0,
+        qty=0.001,  # ~$0.52 notional, below the $1.25 minimum
+    )
+
+    bought = engine.buy_candidates([candidate])
+
+    assert bought == []
+    assert all(t["status"] != "error" for t in db.recent_trades(10))

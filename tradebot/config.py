@@ -132,6 +132,7 @@ class Settings:
     liquidate_on_daily_loss: bool = field(default_factory=lambda: _env_bool("LIQUIDATE_ON_DAILY_LOSS", False))
     profit_lock_dollars: float = field(default_factory=lambda: float(os.getenv("PROFIT_LOCK_DOLLARS", "0")))
     max_consecutive_buy_errors: int = field(default_factory=lambda: int(os.getenv("MAX_CONSECUTIVE_BUY_ERRORS", "3")))
+    min_buy_notional: float = field(default_factory=lambda: float(os.getenv("MIN_BUY_NOTIONAL", "1.25")))
     pause_new_buys_on_degraded_signals: bool = field(default_factory=lambda: _env_bool("PAUSE_NEW_BUYS_ON_DEGRADED_SIGNALS", True))
     buy_kill_switch: bool = field(default_factory=lambda: _env_bool("BUY_KILL_SWITCH", False))
     lookback_days: int = field(default_factory=lambda: int(os.getenv("LOOKBACK_DAYS", "80")))

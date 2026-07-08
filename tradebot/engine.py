@@ -396,10 +396,18 @@ class TradingEngine:
         }
 
     def _consecutive_buy_errors(self) -> int:
+        # Only errors from the current ET trading day count, so the pause
+        # clears on its own at the next session instead of deadlocking
+        # (paused buys can never produce the successful buy that would
+        # otherwise break the streak).
+        today_et = self._today_et()
         count = 0
         for trade in self.db.recent_trades(25):
             if trade.get("side") != "buy":
                 continue
+            created_at = self._parse_timestamp(trade.get("created_at"))
+            if created_at is not None and created_at.astimezone(NY_TZ).date().isoformat() != today_et:
+                break
             if trade.get("status") == "error":
                 count += 1
                 continue
@@ -547,6 +555,32 @@ class TradingEngine:
                 "consecutive_buy_errors": status["consecutive_buy_errors"],
             },
         )
+        self._maybe_alert_buy_error_pause(status)
+
+    def _maybe_alert_buy_error_pause(self, status: Dict[str, object]) -> None:
+        reasons = [str(r) for r in status.get("reasons") or []]
+        if not any(r.startswith("consecutive buy errors") for r in reasons):
+            return
+        # One email per ET day, persisted so restarts don't resend.
+        alert_key = f"buy_error_alert_sent:{self._today_et()}"
+        if self.db.get_bot_state(alert_key):
+            return
+        self.db.set_bot_state(alert_key, self._now_utc().isoformat())
+        try:
+            from .email_report import send_failure_alert
+
+            send_failure_alert(
+                "New buys paused - consecutive buy errors",
+                "The buy-error circuit breaker tripped and new buys are paused. "
+                "It resets automatically at the next trading session.",
+                {
+                    "consecutive_buy_errors": status.get("consecutive_buy_errors"),
+                    "reasons": ", ".join(reasons),
+                    "drawdown_state": status.get("drawdown_state"),
+                },
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("Failed to send buy-error pause alert email")
 
     def _maybe_sync_broker_state(self, force: bool = False) -> None:
         if not self.settings.is_alpaca:
@@ -1982,6 +2016,14 @@ class TradingEngine:
                     qty = min(qty, self._round_share_qty(headroom / candidate.price))
             est_cost = qty * candidate.price
             if qty <= 0 or est_cost > cash_left or est_cost > capital_left:
+                continue
+            if est_cost < self.settings.min_buy_notional:
+                # Alpaca rejects fractional orders under $1 notional; skip instead
+                # of submitting an order that is guaranteed to error out.
+                log.info(
+                    "Skipping %s - order notional $%.2f below minimum $%.2f",
+                    candidate.symbol, est_cost, self.settings.min_buy_notional,
+                )
                 continue
             try:
                 result = self.broker.buy(
