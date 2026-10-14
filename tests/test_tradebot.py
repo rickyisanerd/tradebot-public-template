@@ -2517,6 +2517,8 @@ def test_alpaca_broker_uses_liquid_universe_by_default(tmp_path: Path):
     settings.broker_mode = "paper"
     settings.alpaca_key_id = "key"
     settings.alpaca_secret_key = "secret"
+    settings.max_stock_price = 0  # no price cap, so the mega-cap list is usable
+    settings.live_universe_mode = "liquid"
     settings.__post_init__()
     broker = UniverseAlpacaBroker(settings, [{"symbol": "TINY", "tradable": True}])
 

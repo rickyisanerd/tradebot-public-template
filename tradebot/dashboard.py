@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import logging
 import threading
 from contextlib import asynccontextmanager
@@ -252,6 +253,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.auto_trade_enabled = settings.auto_trade_enabled
     app.state.auto_trade_interval_minutes = settings.auto_trade_interval_minutes
     templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+
+    @app.middleware("http")
+    async def require_dashboard_token(request: Request, call_next):
+        """Gate the dashboard when DASHBOARD_TOKEN is set.
+
+        Without it, anyone who finds the public URL can POST /trade-once and
+        read the account. Open the dashboard once with ?token=<value>; a cookie
+        keeps the buttons working afterwards. API clients can send the
+        X-Dashboard-Token header instead. /health stays open for Railway.
+        """
+        token = settings.dashboard_token
+        if not token or request.url.path == "/health":
+            return await call_next(request)
+        supplied = (
+            request.query_params.get("token")
+            or request.headers.get("x-dashboard-token")
+            or request.cookies.get("tb_token")
+            or ""
+        )
+        if not hmac.compare_digest(supplied, token):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        response = await call_next(request)
+        if request.query_params.get("token"):
+            response.set_cookie("tb_token", token, httponly=True, secure=True, samesite="strict", max_age=60 * 60 * 24 * 30)
+        return response
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request):

@@ -51,7 +51,11 @@ def fetch_status(url: str, timeout: float = 90.0) -> Dict[str, Any]:
     # /api/status recomputes the shadow study (prices every shadow symbol), so
     # it can take a while. Give it room rather than failing on a slow cycle.
     endpoint = url.rstrip("/") + "/api/status"
-    with urllib.request.urlopen(endpoint, timeout=timeout) as resp:
+    request = urllib.request.Request(endpoint)
+    token = os.getenv("TRADEBOT_DASHBOARD_TOKEN", "").strip()
+    if token:
+        request.add_header("X-Dashboard-Token", token)
+    with urllib.request.urlopen(request, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 

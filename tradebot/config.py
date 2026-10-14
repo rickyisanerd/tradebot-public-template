@@ -140,6 +140,16 @@ class Settings:
     dashboard_port: int = field(default_factory=lambda: int(os.getenv("PORT", os.getenv("DASHBOARD_PORT", "8008"))))
     analyzer_mode: str = field(default_factory=lambda: os.getenv("ANALYZER_MODE", "embedded").lower())
     starting_cash: float = field(default_factory=lambda: float(os.getenv("STARTING_CASH", "100000")))
+    # Alpaca daily bars: "sip" is consolidated volume (free plans may use it
+    # for data older than 15 minutes); "iex" is ~2-3% of real volume, which
+    # badly understates liquidity. "all" adjusts bars for splits/dividends so
+    # reverse splits (common under $10) don't look like huge price moves.
+    alpaca_data_feed: str = field(default_factory=lambda: os.getenv("ALPACA_DATA_FEED", "sip").strip().lower())
+    alpaca_bar_adjustment: str = field(default_factory=lambda: os.getenv("ALPACA_BAR_ADJUSTMENT", "all").strip().lower())
+    # Skip setups whose ATR-based stop is wider than the STOP_LOSS_PCT loss
+    # cap: the cap would put the stop inside normal daily noise.
+    reject_stops_inside_noise: bool = field(default_factory=lambda: _env_bool("REJECT_STOPS_INSIDE_NOISE", True))
+    dashboard_token: str = field(default_factory=lambda: os.getenv("DASHBOARD_TOKEN", "").strip())
     polygon_api_key: str = field(default_factory=lambda: os.getenv("POLYGON_API_KEY", "").strip())
     etrade_mirror_enabled: bool = field(default_factory=lambda: _env_bool("ETRADE_MIRROR_ENABLED", False))
     etrade_mirror_env: str = field(default_factory=lambda: os.getenv("ETRADE_MIRROR_ENV", "sandbox").strip().lower())
@@ -164,6 +174,7 @@ class Settings:
     broad_market_etfs: List[str] = field(init=False)
     market_regime_symbols: List[str] = field(init=False)
     liquid_scan_universe: List[str] = field(init=False)
+    universe_mode_auto_switched: bool = field(init=False, default=False)
     demo_seed: int = field(default_factory=lambda: int(os.getenv("DEMO_SEED", "42")))
     data_dir: Path = field(default_factory=lambda: Path(os.getenv("DATA_DIR", Path.cwd() / "data")))
     db_path: Path = field(init=False)
@@ -202,6 +213,19 @@ class Settings:
             "XLF,XLK,XLE,XLV,XLY,XLI,XLU,XLB,XLP,XLRE,XLC,SMH,SOXX",
         )
         self.broad_market_etfs = [x.strip().upper() for x in raw_broad.split(",") if x.strip()]
+        # The built-in "liquid" universe is mega-caps and index ETFs, all priced
+        # far above a low-price cap, so with MAX_STOCK_PRICE set the scan found
+        # no eligible stocks and only the (price-exempt) inverse ETFs survived.
+        # Screen the full Alpaca asset list instead unless the user supplied
+        # their own liquid list.
+        self.universe_mode_auto_switched = False
+        if (
+            self.live_universe_mode == "liquid"
+            and not self.liquid_scan_universe
+            and 0 < self.max_stock_price <= 50
+        ):
+            self.live_universe_mode = "dynamic"
+            self.universe_mode_auto_switched = True
         self.data_dir = Path(self.data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.data_dir / "tradebot.db"

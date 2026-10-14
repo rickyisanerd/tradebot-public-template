@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import random
 import time
@@ -14,6 +15,8 @@ from .config import Settings
 from .models import AccountSnapshot, PositionSnapshot
 from .universe import DEFAULT_UNIVERSE, LIQUID_LARGE_CAP_UNIVERSE
 
+
+log = logging.getLogger(__name__)
 
 class ProviderError(RuntimeError):
     pass
@@ -259,7 +262,9 @@ class AlpacaBroker(BaseBroker):
         tradable = [
             str(item["symbol"]).upper()
             for item in payload if isinstance(payload, list)
-            if item.get("tradable") and not str(item.get("symbol", "")).startswith("$")
+            if item.get("tradable")
+            and not str(item.get("symbol", "")).startswith("$")
+            and str(item.get("exchange", "")).upper() != "OTC"
         ]
         # Rotate the available symbol set by day so a blank SCAN_UNIVERSE does not
         # keep feeding the same small alphabetical slice into each scan.
@@ -275,8 +280,15 @@ class AlpacaBroker(BaseBroker):
             try:
                 resp = self.session.request(method, url, timeout=20, **kwargs)
                 if resp.status_code >= 400:
-                    raise ProviderError(f"Alpaca error {resp.status_code}: {resp.text[:300]}")
+                    error = ProviderError(f"Alpaca error {resp.status_code}: {resp.text[:300]}")
+                    # Client errors (bad order, no SIP access, insufficient
+                    # funds) won't change on retry; only 429/5xx are transient.
+                    if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                        raise error
+                    raise RuntimeError(str(error))
                 return resp.json() if resp.text else {}
+            except ProviderError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 time.sleep(1)
@@ -317,10 +329,21 @@ class AlpacaBroker(BaseBroker):
             "start": start.isoformat(),
             "end": end.isoformat(),
             "limit": days * max(1, len(symbols)),
-            "adjustment": "raw",
-            "feed": "iex",
+            "adjustment": self.settings.alpaca_bar_adjustment or "all",
+            "feed": self._bar_feed(),
         }
-        payload = self._request("GET", f"{self.settings.data_base_url}/v2/stocks/bars", params=params)
+        url = f"{self.settings.data_base_url}/v2/stocks/bars"
+        try:
+            payload = self._request("GET", url, params=params)
+        except ProviderError as exc:
+            # Plans without SIP access get a 403/422; fall back to IEX once and
+            # remember it so every later call doesn't pay for the failed try.
+            if params["feed"] == "iex" or not any(code in str(exc) for code in ("403", "422")):
+                raise
+            log.warning("Alpaca %s feed rejected (%s); falling back to IEX bars", params["feed"], exc)
+            self._feed_fallback = True
+            params["feed"] = "iex"
+            payload = self._request("GET", url, params=params)
         out = payload.get("bars", {})
         normalized: Dict[str, List[dict]] = {}
         for symbol, items in out.items():
@@ -329,6 +352,11 @@ class AlpacaBroker(BaseBroker):
                 for bar in items[-days:]
             ]
         return normalized
+
+    def _bar_feed(self) -> str:
+        if getattr(self, "_feed_fallback", False):
+            return "iex"
+        return self.settings.alpaca_data_feed or "sip"
 
     def latest_prices(self, symbols: List[str]) -> Dict[str, float]:
         if not symbols:

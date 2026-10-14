@@ -1078,6 +1078,10 @@ class TradingEngine:
         stop_from_atr = price - (metrics["atr"] * 1.6)
         stop_from_pct = price * (1 - self.settings.stop_loss_pct)
         stop_price = round(max(stop_from_atr, stop_from_pct, self.settings.min_stock_price * 0.5), 2)
+        # When the 1.6x ATR stop is wider than the loss cap, the cap pulls the
+        # stop inside ordinary daily noise: the trade gets shaken out on a
+        # normal wiggle, and reward/risk looks better than it really is.
+        stop_inside_noise = stop_from_pct > stop_from_atr
         target_from_swing = max(metrics["swing_high20"] * 1.02, price + metrics["atr"] * 2.4)
         target_price = round(target_from_swing, 2)
         reward = max(0.01, target_price - price)
@@ -1165,6 +1169,11 @@ class TradingEngine:
 
         limited_long_by_regime = False
         action = "watch"
+        noise_blocked = (
+            self.settings.reject_stops_inside_noise
+            and stop_inside_noise
+            and not self._is_inverse_etf(symbol)
+        )
         if (
             final_score >= 55
             and reward_risk >= min_reward_risk
@@ -1174,6 +1183,13 @@ class TradingEngine:
         ):
             action = "buy"
             reasons.insert(0, "decision support, liquidity, and reward/risk all cleared the bar")
+        if action == "buy" and noise_blocked:
+            action = "watch"
+            reasons.insert(
+                0,
+                f"too volatile for the {self.settings.stop_loss_pct * 100:.0f}% stop "
+                f"(ATR is {metrics['atr_pct']:.1f}% of price)",
+            )
 
         if (
             action == "buy"
@@ -1194,14 +1210,20 @@ class TradingEngine:
                 metrics["market_regime_blocked"] = 1.0
                 reasons.insert(0, f"market regime filter: {market_regime.get('reason')}")
 
-        if (
-            action == "buy"
-            and self._is_inverse_etf(symbol)
-            and market_regime.get("enabled")
-            and not bool(market_regime.get("inverse_buys_confirmed", True))
-        ):
-            action = "watch"
-            reasons.insert(0, "inverse hedge awaiting multi-session downtrend confirmation")
+        if action == "buy" and self._is_inverse_etf(symbol):
+            # An inverse ETF is a bet that the whole market falls. Without the
+            # regime filter there is no evidence of a downtrend, so the bot was
+            # buying these on short bounces in bull markets (and 3x funds decay
+            # daily). Hedges now require an enabled, confirmed-weak regime.
+            if not market_regime.get("enabled"):
+                action = "watch"
+                reasons.insert(0, "inverse hedges require MARKET_REGIME_FILTER=true")
+            elif bool(market_regime.get("allow_long_buys")):
+                action = "watch"
+                reasons.insert(0, "market regime is an uptrend, so no inverse hedge")
+            elif not bool(market_regime.get("inverse_buys_confirmed", False)):
+                action = "watch"
+                reasons.insert(0, "inverse hedge awaiting multi-session downtrend confirmation")
 
         if action == "buy" and self._in_earnings_blackout(external_inputs):
             action = "watch"
@@ -1214,8 +1236,12 @@ class TradingEngine:
             risk_per_trade_pct = min(risk_per_trade_pct, self.settings.market_regime_limited_long_risk_pct)
             max_position_pct = min(max_position_pct, self.settings.market_regime_limited_long_max_position_pct)
 
-        risk_budget = max(50.0, buying_power * risk_per_trade_pct)
-        position_cap = max(100.0, buying_power * max_position_pct)
+        # `buying_power` is the sizing base (scan_market passes account equity,
+        # capped by buying power). The old $50 risk / $100 position floors put
+        # 10% of a $500 account at risk on a single trade.
+        sizing_base = max(0.0, float(buying_power))
+        risk_budget = sizing_base * risk_per_trade_pct
+        position_cap = sizing_base * max_position_pct
         qty_from_risk = risk_budget / risk
         qty_from_value = position_cap / price
         qty = self._round_share_qty(max(0.0, min(qty_from_risk, qty_from_value)))
@@ -1321,12 +1347,15 @@ class TradingEngine:
             log.warning("No bar data returned for %d symbols", len(symbols))
             self.db.record_scan(self.settings.broker_mode, self.broker.name, [])
             return []
+        # Size off equity, not margin buying power (which is 2-4x equity on a
+        # margin account and silently levered every position).
+        sizing_base = min(float(account.equity), float(account.buying_power)) if account.equity > 0 else float(account.buying_power)
         candidates: List[Candidate] = []
         for symbol in symbols:
             item = bars.get(symbol)
             if not item:
                 continue
-            candidate = self._candidate_from_bars(symbol, item, account.buying_power, market_regime=market_regime)
+            candidate = self._candidate_from_bars(symbol, item, sizing_base, market_regime=market_regime)
             if candidate:
                 candidates.append(candidate)
         candidates.sort(key=lambda x: (x.action == "buy", x.final_score, x.reward_risk), reverse=True)
@@ -1704,6 +1733,7 @@ class TradingEngine:
         daily_liquidation_reason = self._daily_loss_liquidation_reason(self.broker.account())
         sold: List[dict] = list(broker_notes)
         rotation_market_open: Optional[bool] = None
+        hedge_regime: Optional[Dict[str, object]] = None
         for position in positions:
             meta = self.db.get_position_meta(position.symbol)
             if not meta:
@@ -1740,6 +1770,25 @@ class TradingEngine:
                     if sold_item:
                         sold.append(sold_item)
                     continue
+
+            # Exit inverse hedges once the downtrend that justified them is gone.
+            # Held >= 1 day so the sell can never count as a PDT day trade.
+            if self._is_inverse_etf(position.symbol) and held_days >= 1:
+                if hedge_regime is None:
+                    hedge_regime = self._market_regime_status()
+                hedge_still_valid = bool(hedge_regime.get("enabled")) and (
+                    not bool(hedge_regime.get("allow_long_buys")) or hedge_regime.get("state") == "missing"
+                )
+                if not hedge_still_valid:
+                    if rotation_market_open is None:
+                        rotation_market_open = self.settings.is_demo or not self._market_is_closed()
+                    if rotation_market_open:
+                        sold_item = self._sell_position(
+                            position, current, "closing inverse hedge: market regime is no longer weak", meta
+                        )
+                        if sold_item:
+                            sold.append(sold_item)
+                        continue
 
             target_price = float(meta["target_price"])
             if target_price > 0 and current >= target_price and held_days >= self.settings.min_hold_days:
@@ -1789,7 +1838,9 @@ class TradingEngine:
                         sell_qty, position.symbol, recorded_price, pnl_pct, remaining_qty,
                     )
                     sold.append({"symbol": position.symbol, "pnl_pct": round(pnl_pct, 2), "note": f"partial profit ({sell_qty:.4f} shares)"})
-                continue  # skip full-sell check this cycle, re-evaluate next cycle
+                    continue  # skip full-sell check this cycle, re-evaluate next cycle
+                # A failed partial sell must NOT skip the stop checks below;
+                # previously it did, every cycle, leaving the position unguarded.
 
             should_sell = False
             note = ""
@@ -1962,21 +2013,13 @@ class TradingEngine:
         bought: List[dict] = []
         open_position_limit = self.settings.max_open_positions or (len(positions) + self.settings.max_new_positions_per_run)
         slots = min(self.settings.max_new_positions_per_run, max(0, open_position_limit - len(positions)))
-        cash_left = account.buying_power
+        # Spend real cash only; margin buying power is not a budget.
+        cash_left = min(float(account.buying_power), float(account.cash)) if account.cash > 0 else 0.0
         if self.settings.cash_buffer_pct > 0:
             cash_left = max(0.0, cash_left - account.equity * self.settings.cash_buffer_pct)
         deployed_capital = sum(p.market_value for p in positions)
         capital_limit = self.settings.max_total_capital if self.settings.max_total_capital > 0 else max(account.equity, deployed_capital + cash_left)
         capital_left = max(0.0, capital_limit - deployed_capital)
-        # Dynamic equity-based position sizing
-        if self.settings.is_small_account:
-            effective_risk_per_trade_pct = max(self.settings.risk_per_trade_pct, 0.04)
-            effective_max_position_pct = max(self.settings.max_position_pct, 0.25)
-        else:
-            effective_risk_per_trade_pct = self.settings.risk_per_trade_pct
-            effective_max_position_pct = self.settings.max_position_pct
-        risk_budget = max(50.0, account.equity * effective_risk_per_trade_pct)
-        position_cap = max(100.0, account.equity * effective_max_position_pct)
         held_values: List[Tuple[str, float]] = [(p.symbol, float(p.market_value)) for p in positions]
         for candidate in candidates:
             if slots <= 0:
